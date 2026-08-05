@@ -92,7 +92,33 @@ else
   say "woam: take the first snapshot with:  sudo woam baseline"
 fi
 
+# --- attribution ---------------------------------------------------------------
+# Without this woam can tell you WHAT changed but not WHO changed it, and it will say so
+# rather than guess. auditd is the only thing on the machine that knows: auid is the login
+# uid, it survives sudo, and auid=4294967295 means no login session was behind a write. So
+# `auid != unset` is exactly "an agent or a person did this, not the OS".
+#
+# Everything here is best-effort and bounded. A machine with change detection and no
+# attribution is useful; a machine whose provisioning hung on apt is not.
+if [ "${WOAM_AUDIT:-1}" = "1" ] && [ "$(id -u)" = "0" ]; then
+  if ! command -v auditctl >/dev/null 2>&1; then
+    say "woam: installing auditd (attribution layer)"
+    # Lock::Timeout rather than a hand-rolled wait loop: cloud-init and
+    # unattended-upgrades hold the apt lock at exactly this point in a boot.
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180 install -y auditd \
+      >>/var/log/woam-install.log 2>&1 || say "woam: auditd install failed, continuing without attribution"
+  fi
+  if command -v auditctl >/dev/null 2>&1; then
+    systemctl enable --now auditd >/dev/null 2>&1 || true
+    "$DEST" audit-install >/dev/null 2>&1 && say "woam: attribution ON (auditd watches installed)" \
+      || say "woam: auditd present but watches did not load; woam will report attribution as UNKNOWN"
+  fi
+elif [ "${WOAM_AUDIT:-1}" = "1" ]; then
+  say "woam: not root, skipping attribution setup.  sudo woam audit-install  turns it on."
+fi
+
 say ""
 say "  woam                  what changed on this machine, and why"
+say "  woam who <path>       who wrote it: auid survives sudo, so this is evidence"
 say "  woam note <group> \"…\"  record what you did"
 say "  woam groups           the path to group map"

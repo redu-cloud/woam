@@ -48,25 +48,67 @@ A machine changes constantly on its own: log rotation, unattended upgrades, cron
 state. **None of that is an agent's doing, and attributing it to one is a lie that costs a
 session.**
 
-An early version diffed against a long-lived baseline and told an agent that
-`/root/.ssh/authorized_keys` and two `/etc/sudoers.d` files had been **deleted**. Nothing had
-touched them. A phantom root-key deletion is exactly the kind of report that burns an hour.
+**The diff engine cannot tell the difference, and never could.** It compares two points in
+time and infers, so it has no evidence of who wrote anything. An early version diffed against
+a long-lived baseline and told an agent that `/root/.ssh/authorized_keys` and two
+`/etc/sudoers.d` files had been **deleted**. Nothing had touched them. A phantom root-key
+deletion is exactly the kind of report that burns an hour.
 
-So the diff is scoped to a session:
+**The kernel already knows.** One audit watch per group path, and every write carries the
+identity of whoever caused it:
+
+```
+type=SYSCALL ... auid=1000 uid=0 ses=226 comm="sh" exe="/usr/bin/dash" key="woam"
+type=PATH    ... name="/etc/redu-app/redu-app.env" nametype=NORMAL
+```
+
+- **`auid` is the LOGIN uid and it survives `sudo`.** That process ran as `uid=0`; `auid` is
+  still the account that logged in. Nothing in userspace can reconstruct that.
+- **`ses` is the PAM session id**: which login did it, exactly.
+- **`auid=4294967295` (unset) means no login session was behind the write.** Measured on a
+  live VM: an agent's write records `auid=1000`; a `systemd-run` write records the sentinel.
+
+So **`auid != unset` is precisely "an agent or a person did this, not the OS"** - no
+heuristic, no time window, no guessing. Measured, both writing to the same file two seconds
+apart:
+
+```
+  THE SYSTEM DID THESE - no record needed, no login session behind them:
+
+    schedule  cron(1)   (auid unset on every recorded write)
+
+  UNRECORDED CHANGES - these groups changed and nothing says why:
+
+    app       env(1)   since 2026-08-05T11:47:38Z
+                BY   ubuntu(auid=1000,ses=226)
+                mod  /etc/redu-app/redu-app.env
+```
+
+```bash
+woam who <path>       # who wrote it, with the session and the program
+woam audit-install    # (root) generate the watches from the groups and load them
+woam audit-status     # is attribution on, and if not, why not
+```
+
+**The verdict is one of five, and four of them are admissions:** `agent`, `system`,
+`none` (watched, nothing recorded), `unwatched` (not covered, so nothing can be concluded)
+and `no-audit`. Absence of a record only means "the OS did it" for a path we were actually
+watching; anywhere else it means we do not know, and woam says so.
+
+With auditd absent, woam still reports **what** changed and states plainly that it cannot
+say **who**. It does not fall back to guessing.
+
+### The session-scoped diff is now the fallback, not the mechanism
 
 ```
 woam session-open <id>      # snapshot at login   (PAM open_session)
 woam seal --session <id>    # diff at logout      (PAM close_session)
 ```
 
-The delta between those two points is what happened **while that agent was logged in**.
-Changes made before it arrived are absorbed into its opening snapshot and never reported.
-Verified: with a file changed by the OS before login and one changed by the agent after, the
-session-scoped seal reports **only the agent's**; the unscoped one blames it for both.
-
-The honest limit: something the OS does *during* a session is still attributed to the agent.
-That window is minutes instead of days, and it is bounded rather than unbounded.
-[`docs/DESIGN.md`](docs/DESIGN.md) covers the mechanism that removes the limit entirely.
+This still works and still bounds the damage on a machine with no auditd: the delta between
+those two points is what happened while that agent was logged in. But it is inference, and
+its honest limit is that anything the OS does *during* a session is still charged to the
+agent. Attribution is what removes that limit; this narrows it.
 
 ## The last write is the one nobody does
 

@@ -39,6 +39,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -190,12 +191,255 @@ def now() -> str:
 
 
 def actor() -> str:
-    """Best-effort identity. Never fabricates: unknown stays unknown."""
+    """Best-effort identity. Never fabricates: unknown stays unknown.
+
+    The kernel answer comes FIRST. /proc/self/loginuid is the login uid, set by PAM at
+    session open, and it survives sudo and su: a process running as root still carries the
+    uid of whoever logged in. Environment variables cannot do this. SSH_CLIENT is absent
+    when PAM runs a hook as root - which is exactly how the earlier PAM integration recorded
+    `by=unknown@plausible` for a write it had complete information about.
+    """
+    auid, ses = self_login()
+    if auid is not None and auid != AUID_UNSET:
+        return f"{uid_name(auid)}(auid={auid},ses={ses if ses is not None else '?'})"
     for env in ("WOAM_ACTOR", "CLAUDE_SESSION_ID", "SSH_CLIENT"):
         v = os.environ.get(env)
         if v:
             return v.split()[0][:64]
     return f"{os.environ.get('USER', 'unknown')}@{os.uname().nodename}"
+
+
+def claimed_actor():
+    """What the caller SAYS it is. Recorded alongside the kernel's answer, never instead
+    of it.
+
+    Both are worth having and they are not the same kind of fact. The kernel knows the
+    login session; it cannot know that three different agents shared it, and a session id
+    is genuinely useful for finding the transcript later. But an identity the subject
+    supplies about itself is a claim, not evidence, and letting it overwrite `by` would
+    mean anything with an env var could sign a record as somebody else. So it lands in its
+    own field, named for what it is.
+    """
+    for env in ("WOAM_ACTOR", "CLAUDE_SESSION_ID"):
+        v = os.environ.get(env)
+        if v:
+            return v.split()[0][:64]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ATTRIBUTION. Who wrote a file, on the kernel's authority rather than ours.
+#
+# The diff engine below compares two points in time and INFERS. It has no evidence of
+# who did anything, so it is structurally incapable of attribution, and every
+# misattribution woam has ever produced traces to that. It once reported
+# /root/.ssh/authorized_keys and two /etc/sudoers.d files as DELETED when nothing had
+# touched them: a fabricated security event.
+#
+# The kernel already records the truth. One audit watch produces, for a real write:
+#
+#   type=SYSCALL ... auid=1000 uid=0 ses=214 comm="sed" exe="/usr/bin/sed" key="woam"
+#   type=PATH    ... name="/etc/redu-app/app.env" nametype=NORMAL
+#
+#   * auid is the LOGIN uid and SURVIVES SUDO. The process above ran as uid=0; auid is
+#     still the person who logged in. Nothing in userspace can reconstruct that.
+#   * ses is the PAM session id: which login did this, exactly.
+#   * auid=4294967295 (unset) means NO LOGIN SESSION is behind the write. Measured: an
+#     agent's write records auid=1000; a systemd unit's records the sentinel.
+#
+# So `auid != AUID_UNSET` is precisely "a person or an agent did this, not the OS". That
+# is the whole requirement, answered by a field the kernel fills in for free.
+#
+# WHY THE RAW LOG AND NOT `ausearch`
+#     Measured on a live VM, auditd 3.1.2: records land in /var/log/audit/audit.log within
+#     one second, and `ausearch -k woam` reports "<no matches>" for those same records
+#     FOREVER, while `ausearch --input /var/log/audit/audit.log -k woam` finds them. Its
+#     default input resolution cannot be relied on. Shelling to it would have made woam
+#     report "no agent activity" on every machine, silently, which is the exact
+#     confidently-wrong failure this tool exists to prevent. The log format is stable and
+#     documented; parsing it costs less than depending on that behaviour.
+# ---------------------------------------------------------------------------
+AUID_UNSET = 4294967295          # kernel sentinel for "no login session behind this"
+AUDIT_KEY = "woam"
+AUDIT_LOG = Path(os.environ.get("WOAM_AUDIT_LOG", "/var/log/audit/audit.log"))
+AUDIT_RULES = Path(os.environ.get("WOAM_AUDIT_RULES", "/etc/audit/rules.d/woam.rules"))
+
+
+def self_login():
+    """(auid, ses) of THIS process, straight from the kernel. (None, None) if unavailable
+    (a kernel without audit support, or a container that does not expose it)."""
+    def rd(p):
+        try:
+            v = int(Path(p).read_text().strip())
+            return v
+        except Exception:
+            return None
+    return rd("/proc/self/loginuid"), rd("/proc/self/sessionid")
+
+
+def uid_name(uid: int) -> str:
+    """Resolve a uid to a name without pwd lookups failing the tool."""
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except Exception:
+        return str(uid)
+
+
+_AUDIT_HEAD = re.compile(r"^type=(?P<t>\w+) msg=audit\((?P<ts>\d+(?:\.\d+)?):(?P<serial>\d+)\):\s*(?P<rest>.*)$")
+
+
+def _qfield(rest: str, name: str):
+    """A quoted audit field: comm="sed". Returns None if absent."""
+    m = re.search(r'\b%s="([^"]*)"' % re.escape(name), rest)
+    return m.group(1) if m else None
+
+
+def _nfield(rest: str, name: str):
+    """A numeric audit field: auid=1000. Returns None if absent or not a number."""
+    m = re.search(r"\b%s=(-?\d+)\b" % re.escape(name), rest)
+    return int(m.group(1)) if m else None
+
+
+def audit_available():
+    """(ok, reason). NEVER raises, and never answers "fine" when it does not know."""
+    if not AUDIT_LOG.exists():
+        return False, f"no audit log at {AUDIT_LOG} (auditd not installed?)"
+    if not os.access(str(AUDIT_LOG), os.R_OK):
+        return False, f"{AUDIT_LOG} is not readable by this user (run as root)"
+    return True, ""
+
+
+def audit_watched_paths():
+    """The paths woam has asked the kernel to watch, from OUR rules file.
+
+    This matters more than it looks. Absence of an audit event only means "the OS did it"
+    for a path that is actually WATCHED. For an unwatched path, absence means we do not
+    know - and reporting that as "the system did it" would be a fabrication of exactly the
+    kind this layer exists to end.
+    """
+    out = []
+    try:
+        for line in AUDIT_RULES.read_text().splitlines():
+            m = re.match(r"\s*-w\s+(\S+)", line)
+            if m:
+                out.append(m.group(1).rstrip("/"))
+    except Exception:
+        pass
+    return out
+
+
+def audit_writes(since_epoch: float = 0.0, key: str = AUDIT_KEY, limit: int = 4000):
+    """Write events carrying `key`, correlated SYSCALL+PATH, newest last.
+
+    Returns [{ts, serial, auid, ses, comm, exe, success, paths:[...] , system:bool}].
+    `system` is True when auid is the unset sentinel, i.e. no login session was behind it.
+    Never raises: an unreadable or malformed log yields [] and audit_available() explains.
+    """
+    ok, _ = audit_available()
+    if not ok:
+        return []
+    events, order = {}, []
+    try:
+        with AUDIT_LOG.open("r", errors="replace") as fh:
+            for line in fh:
+                m = _AUDIT_HEAD.match(line)
+                if not m:
+                    continue
+                ts = float(m.group("ts"))
+                if ts < since_epoch:
+                    continue
+                serial, typ, rest = m.group("serial"), m.group("t"), m.group("rest")
+                if typ == "SYSCALL":
+                    if _qfield(rest, "key") != key:
+                        continue
+                    auid = _nfield(rest, "auid")
+                    if serial not in events:
+                        order.append(serial)
+                    events[serial] = {
+                        "ts": ts, "serial": serial,
+                        "auid": auid, "ses": _nfield(rest, "ses"),
+                        "comm": _qfield(rest, "comm"), "exe": _qfield(rest, "exe"),
+                        "success": _qfield(rest, "success") or
+                                   (re.search(r"\bsuccess=(\w+)", rest).group(1)
+                                    if re.search(r"\bsuccess=(\w+)", rest) else None),
+                        "paths": [],
+                        # The single load-bearing classification in this file.
+                        "system": auid is None or auid == AUID_UNSET or auid < 0,
+                    }
+                elif typ == "PATH" and serial in events:
+                    # nametype=PARENT names the containing directory, not the thing that
+                    # changed. Recording it would attribute a write to /etc rather than to
+                    # the file, which reads as a far bigger event than it was.
+                    if re.search(r"\bnametype=PARENT\b", rest):
+                        continue
+                    nm = _qfield(rest, "name")
+                    if nm and nm not in events[serial]["paths"]:
+                        events[serial]["paths"].append(nm)
+    except Exception:
+        return []
+    return [events[s] for s in order[-limit:]]
+
+
+def attribution_for(paths, since_epoch: float = 0.0):
+    """Who touched these paths, as evidence rather than inference.
+
+    Returns (verdict, actors, events) where verdict is one of:
+        "agent"    - at least one write from a real login session
+        "system"   - writes exist, all from OUTSIDE any login session (the OS did it)
+        "none"     - the paths are watched and no write was recorded at all
+        "unwatched"- not covered by a woam audit rule, so nothing can be concluded
+        "no-audit" - auditd unavailable; this layer has nothing to say
+    """
+    ok, _ = audit_available()
+    if not ok:
+        return "no-audit", [], []
+    watched = audit_watched_paths()
+    if not watched:
+        return "unwatched", [], []
+
+    def covered(p):
+        p = str(p)
+        return any(p == w or p.startswith(w + "/") for w in watched)
+
+    if not any(covered(p) for p in paths):
+        return "unwatched", [], []
+
+    wanted = {str(p) for p in paths}
+    hits = [e for e in audit_writes(since_epoch)
+            if any(p in wanted for p in e["paths"])]
+    if not hits:
+        return "none", [], []
+    human = [e for e in hits if not e["system"]]
+    if not human:
+        return "system", [], hits
+    actors = sorted({f"{uid_name(e['auid'])}(auid={e['auid']},ses={e['ses']})" for e in human})
+    return "agent", actors, human
+
+
+def audit_rules_text() -> str:
+    """The auditctl rules for every group path, GENERATED FROM GROUPS.
+
+    Generated, never hand-written, so the watches and the groups cannot drift apart. A
+    group whose path is not watched would report "the system did it" for every agent write
+    to it, which is worse than reporting nothing.
+
+    Narrow by construction: one watch per configured path, `-p wa` (write + attribute), and
+    never `-w /`. Watch breadth is what audit overhead is proportional to.
+    """
+    lines = [
+        "# GENERATED by `woam audit-rules`. Do not edit; edit the GROUPS table in woam.",
+        "# -p wa = write + attribute change. Narrow watches only: never -w /.",
+    ]
+    seen = set()
+    for _g, _s, si in all_subs():
+        for p in si["paths"]:
+            p = p.split("*")[0].rstrip("/") if "*" in p else p
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            lines.append(f"-w {p} -p wa -k {AUDIT_KEY}")
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +449,10 @@ def actor() -> str:
 # ---------------------------------------------------------------------------
 def append(rec: dict) -> None:
     rec = {"ts": now(), "v": VERSION, **rec}
+    # A self-declared label, kept separate from `by` so a claim can never pass for evidence.
+    claim = claimed_actor()
+    if claim and "claims" not in rec:
+        rec["claims"] = claim
     line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
     if len(line.encode()) > 3900:  # stay under PIPE_BUF so O_APPEND is atomic
         rec["why"] = (rec.get("why") or "")[:600] + " ...(truncated)"
@@ -493,6 +741,41 @@ def rebaseline(names=None) -> None:
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
+def epoch_of(ts: str) -> float:
+    """Our ISO-Z timestamp back to epoch seconds. 0.0 on anything unparseable, which makes
+    a caller search the whole log rather than silently search none of it."""
+    try:
+        import calendar
+        return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+    except Exception:
+        return 0.0
+
+
+def classify_dirty(dirty: dict):
+    """Split changed groups by WHO changed them, using kernel evidence.
+
+    This is the whole point of the audit layer. Before it, every change on the box was
+    reported to the agent as its own, so a log rotation or an unattended-upgrade read as
+    "you changed this and did not say why" - and the agent either recorded a fiction or
+    learned to ignore the tool.
+
+    Conservative on purpose. Only a group whose every recorded write came from OUTSIDE a
+    login session is moved to `system`. "Watched but no event" stays with the agent,
+    because a change predating the watch, or a rotated log, is not evidence that the OS
+    did it, and inventing that would be the same fabrication in the other direction.
+    """
+    agent, system = {}, {}
+    for name, d in dirty.items():
+        paths = []
+        for _sname, dd in (d.get("named") or {}).items():
+            for kind in ("modified", "created", "removed"):
+                paths.extend(dd.get(kind) or [])
+        verdict, actors, _ev = attribution_for(paths, epoch_of(d.get("since", "")))
+        d["verdict"], d["actors"] = verdict, actors
+        (system if verdict == "system" else agent)[name] = d
+    return agent, system
+
+
 def cmd_status(argv) -> int:
     dirty = dirty_groups()
     entries = read_log()
@@ -516,11 +799,32 @@ def cmd_status(argv) -> int:
     if gaps:
         print(f"\n  {len(gaps)} unexplained change(s):  woam gaps")
 
-    if dirty:
+    audit_ok, audit_why = audit_available()
+    agent_dirty, system_dirty = classify_dirty(dirty)
+
+    if system_dirty:
+        # NOT the agent's problem, and saying so is the point. Every one of these would
+        # previously have been reported as "you changed this and did not say why".
+        print("\n  THE SYSTEM DID THESE - no record needed, no login session behind them:\n")
+        for name, d in system_dirty.items():
+            subs = ", ".join(f"{sn}({fc})" for sn, fc in d["subs"]) or "?"
+            print(f"    {name:9s} {subs}   (auid unset on every recorded write)")
+
+    if agent_dirty:
         print("\n  UNRECORDED CHANGES - these groups changed and nothing says why:\n")
-        for name, d in dirty.items():
+        for name, d in agent_dirty.items():
             subs = ", ".join(f"{sn}({fc})" for sn, fc in d["subs"]) or "?"
             print(f"    {name:9s} {subs}   since {d['since']}")
+            # Who, on the kernel's evidence rather than ours.
+            v, actors = d.get("verdict"), d.get("actors") or []
+            if v == "agent":
+                print(f"    {'':9s}   BY   {', '.join(actors)}")
+            elif v == "none":
+                print(f"    {'':9s}   BY   unrecorded - the change predates the watch, or the log rotated")
+            elif v == "unwatched":
+                print(f"    {'':9s}   BY   UNKNOWN - these paths are not watched, so nothing can be concluded")
+            elif v == "no-audit":
+                print(f"    {'':9s}   BY   UNKNOWN - attribution is off on this machine")
             for sname, dd in (d.get("named") or {}).items():
                 for kind in ("modified", "created", "removed"):
                     for f in dd[kind][:4]:
@@ -534,6 +838,12 @@ def cmd_status(argv) -> int:
                     print(f"    {'':9s}   ??   {u}  (seen before, UNREADABLE now - not deleted)")
             print(f"    {'':9s} record it:  woam note {name} \"what you did and why\"")
             print(f"    {'':9s} or defer:   woam note {name} --defer \"reason unknown\"")
+        if not audit_ok:
+            # The one thing that must never be quiet: a report that looks like attribution
+            # but is not one.
+            print(f"\n  ⚠ ATTRIBUTION IS OFF ({audit_why}).")
+            print("  These groups CHANGED; who changed them is not known, and some of it may")
+            print("  be the operating system's own work. Turn it on:  woam audit-install")
         print("\n  Writing costs a few tokens. Not writing costs the next agent thousands,")
         print("  or worse, sends it down a path that does not work here.")
         return 1                       # non-zero: `woam status && deploy` stops
@@ -683,8 +993,23 @@ def cmd_seal(argv) -> int:
             try: session_file(sid).unlink()
             except Exception: pass
         return 0
+    # Attribution BEFORE sealing. Groups the OS changed are not gaps: nobody owes an
+    # explanation for log rotation or an unattended upgrade, and asking for one is how a
+    # record gets fabricated to make the tool shut up.
+    agent_dirty, system_dirty = classify_dirty(dirty)
+    if system_dirty:
+        print(f"  skipped {len(system_dirty)} group(s) the SYSTEM changed: "
+              + ", ".join(system_dirty) + " (no login session behind them)")
+    if not agent_dirty:
+        print("nothing unrecorded that a login session is responsible for")
+        rebaseline(list(dirty))
+        if sid:
+            try: session_file(sid).unlink()
+            except Exception: pass
+        return 0
+
     sealed = 0
-    for group, d in dirty.items():
+    for group, d in agent_dirty.items():
         what = []
         for sname, dd in (d.get("named") or {}).items():
             for kind in ("modified", "created", "removed"):
@@ -693,10 +1018,17 @@ def cmd_seal(argv) -> int:
             for kd in (dd.get("keys") or [])[:8]:
                 what.append(f"key:{sname}:{kd}")
         gid = hashlib.sha256(f"{group}{now()}{d.get('files')}".encode()).hexdigest()[:6]
-        append({"ev": "gap", "id": gid, "group": group, "by": actor(),
+        # `by` is the AUDITED writer, not whoever ran seal. Under the PAM hook seal runs as
+        # root with no SSH_CLIENT, which is exactly how the earlier version recorded
+        # `by=unknown@plausible` for a write it had complete information about.
+        by = ", ".join(d.get("actors") or []) or actor()
+        append({"ev": "gap", "id": gid, "group": group, "by": by,
+                "by_evidence": d.get("verdict"), "sealed_by": actor(),
                 "subs": [sn for sn, _ in d.get("subs", [])], "what": what[:20],
                 "files": d.get("files"), "why": None, "closed": False})
         print(f"  {gid}  {group}: {d.get('files')} file(s) changed, WHY NOT RECORDED")
+        print(f"          by {by}" + ("" if d.get("verdict") == "agent" else
+                                      f"  (attribution: {d.get('verdict')})"))
         for w in what[:4]:
             print(f"          {w}")
         sealed += 1
@@ -793,10 +1125,107 @@ def cmd_which(argv) -> int:
     return 0
 
 
+def cmd_who(argv) -> int:
+    """Who wrote this path, on the kernel's evidence. The question the diff engine can
+    never answer, and the reason this layer exists."""
+    if not argv:
+        print("usage: woam who <path> [path...]", file=sys.stderr)
+        return 2
+    ok, why = audit_available()
+    if not ok:
+        # An honest "I cannot tell you" beats a guess dressed as an answer.
+        print(f"attribution UNAVAILABLE: {why}", file=sys.stderr)
+        print("  woam audit-install   (as root) sets it up", file=sys.stderr)
+        return 1
+    verdict, actors, events = attribution_for(argv)
+    if verdict == "unwatched":
+        print("NOT WATCHED. Nothing can be concluded about these paths, and absence of a")
+        print("record here does NOT mean nothing happened.")
+        print("  woam audit-rules   shows what would be watched")
+        return 1
+    if verdict == "none":
+        print("watched, and no write recorded since the log begins.")
+        return 0
+    if verdict == "system":
+        print("SYSTEM. Every recorded write came from outside a login session")
+        print("(auid unset), so no agent or person did this.")
+    else:
+        print("AGENT/HUMAN: " + ", ".join(actors))
+    for e in events[-10:]:
+        who = "system" if e["system"] else f"{uid_name(e['auid'])} ses={e['ses']}"
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(e["ts"]))
+        print(f"  {stamp}  {who:24s} {e['comm'] or '?':10s} {' '.join(e['paths'])}")
+    return 0
+
+
+def cmd_audit_rules(argv) -> int:
+    """Print the watches, generated from GROUPS so the two cannot drift."""
+    sys.stdout.write(audit_rules_text())
+    return 0
+
+
+def cmd_audit_status(argv) -> int:
+    ok, why = audit_available()
+    print(f"audit log     {AUDIT_LOG}  {'readable' if ok else 'NO - ' + why}")
+    print(f"rules file    {AUDIT_RULES}  {'present' if AUDIT_RULES.exists() else 'ABSENT'}")
+    watched = audit_watched_paths()
+    print(f"watched paths {len(watched)}")
+    auid, ses = self_login()
+    if auid is None:
+        print("this process  loginuid UNAVAILABLE (kernel without audit support?)")
+    elif auid == AUID_UNSET:
+        print("this process  auid=unset - NO login session behind it (a service, cron, or boot)")
+    else:
+        print(f"this process  auid={auid} ({uid_name(auid)})  ses={ses}")
+    if not ok or not watched:
+        # Say plainly what is lost, rather than letting a quiet report imply everything works.
+        print("\nATTRIBUTION IS OFF. woam can still tell you WHAT changed; it cannot tell you")
+        print("who, and it will not pretend otherwise.")
+        return 1
+    return 0
+
+
+def cmd_audit_install(argv) -> int:
+    """Write the rules and load them. Root only; says what it needs rather than half-doing it."""
+    if os.geteuid() != 0:
+        print("woam audit-install must run as root (it writes audit rules).", file=sys.stderr)
+        return 1
+    if not sh("command -v auditctl"):
+        print("auditctl not found. Install the audit package first:", file=sys.stderr)
+        print("  apt-get install -y auditd", file=sys.stderr)
+        return 1
+    try:
+        AUDIT_RULES.parent.mkdir(parents=True, exist_ok=True)
+        AUDIT_RULES.write_text(audit_rules_text())
+        os.chmod(str(AUDIT_RULES), 0o600)
+    except Exception as e:
+        print(f"could not write {AUDIT_RULES}: {e}", file=sys.stderr)
+        return 1
+    # Load now as well as at boot. A rule that only applies after the next reboot is a
+    # blind window nobody remembers to close.
+    loaded, failed = 0, 0
+    for line in audit_rules_text().splitlines():
+        if not line.startswith("-w"):
+            continue
+        path = line.split()[1]
+        if not Path(path).exists():
+            continue                      # auditctl refuses a watch on a missing path
+        r = subprocess.run(["auditctl"] + line.split(), capture_output=True, text=True)
+        loaded += 1 if r.returncode == 0 else 0
+        failed += 0 if r.returncode == 0 else 1
+    print(f"{AUDIT_RULES} written; {loaded} watch(es) loaded"
+          + (f", {failed} failed" if failed else ""))
+    if failed:
+        print("a failed watch means those paths have NO attribution. That is a gap, not a warning.")
+    return 0
+
+
 COMMANDS = {
     "status": cmd_status, "show": cmd_show, "note": cmd_note, "fix": cmd_fix,
     "gaps": cmd_gaps, "log": cmd_log, "groups": cmd_groups, "which": cmd_which,
     "seal": cmd_seal, "why": cmd_why, "session-open": cmd_session_open,
+    "who": cmd_who, "audit-rules": cmd_audit_rules, "audit-status": cmd_audit_status,
+    "audit-install": cmd_audit_install,
     "baseline": lambda a: (rebaseline(a or None), print("baseline recorded"), 0)[-1],
 }
 

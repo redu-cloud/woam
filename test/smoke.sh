@@ -147,8 +147,15 @@ for i, ln in enumerate(open(sys.argv[1], encoding="utf-8"), 1):
         bad.append(f"line {i} is not valid JSON: {e}")
 if not recs:
     bad.append("no records were written at all")
-if any(r.get("by") != "smoke@test" for r in recs if r.get("by")):
-    bad.append("WOAM_ACTOR was ignored; attribution would be wrong")
+# `by` must be the KERNEL's answer, and WOAM_ACTOR must NOT be able to overwrite it.
+# An identity the subject supplies about itself is a claim; if it could sign a record as
+# somebody else, the whole attribution layer would be decorative.
+if any(r.get("by") == "smoke@test" for r in recs):
+    bad.append("WOAM_ACTOR overwrote `by` - a self-declared identity is passing for evidence")
+if not any(r.get("claims") == "smoke@test" for r in recs):
+    bad.append("the caller's self-declared label was dropped instead of recorded as a claim")
+if not any("auid=" in str(r.get("by", "")) for r in recs):
+    bad.append("`by` does not carry the kernel login identity")
 if not any(r.get("ev") == "gap_closed" for r in recs):
     bad.append("closing a gap did not append a gap_closed record")
 print(";".join(bad))
@@ -181,7 +188,27 @@ MS=$(( ($(date +%s%N) - START) / 1000000 ))
 t "status completes in under 3s (${MS}ms)" "$([ "$MS" -lt 3000 ] && echo 0 || echo 1)" "${MS}ms"
 
 echo
-echo "[12] house style, checked mechanically because prose never holds"
+echo "[12] attribution (delegated to test/attribution.py, real kernel records)"
+if python3 "$HERE/attribution.py" >"$WOAM_ROOT/.attrib.out" 2>&1; then
+  ok "attribution suite ($(grep -oE '^[0-9]+ passed' "$WOAM_ROOT/.attrib.out") against captured audit records)"
+else
+  bad "attribution suite" "$(tail -12 "$WOAM_ROOT/.attrib.out")"
+fi
+
+echo
+echo "[13] the audit surface degrades honestly on a box with no auditd"
+rc=$(WOAM_AUDIT_LOG=/nonexistent/audit.log run audit-status)
+t "audit-status exits non-zero when attribution is off" "$([ "$rc" = 1 ] && echo 0 || echo 1)" "got exit $rc"
+t "and says attribution is OFF rather than staying quiet" "$(has 'ATTRIBUTION IS OFF')"
+rc=$(WOAM_AUDIT_LOG=/nonexistent/audit.log run who /etc/hosts)
+t "who exits non-zero rather than answering" "$([ "$rc" = 1 ] && echo 0 || echo 1)" "got exit $rc"
+t "and never invents an answer" "$(hasnt 'AGENT/HUMAN')"
+run audit-rules >/dev/null
+t "audit-rules still prints the watches with no auditd installed" "$(has '-k woam')"
+t "and never watches the whole filesystem" "$(hasnt '-w / -p')"
+
+echo
+echo "[14] house style, checked mechanically because prose never holds"
 # A documented no-em-dash rule was violated 4,237 times across 168 files in the
 # repo this tool came from, by agents that had read the rule. One greppable
 # character; the check takes a second and the document took none.

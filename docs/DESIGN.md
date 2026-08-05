@@ -54,6 +54,9 @@ had been deleted, when nothing had touched them.
 Scoping the diff to a login session bounds the damage (see the PAM integration) but does not fix
 the foundation. Anything the OS does *during* the session is still attributed to the agent.
 
+**This is now built.** The diff is the content layer (what the file says); auditd is the
+attribution layer (who, which session, which program). What follows is the mechanism.
+
 **The kernel already records the evidence.** One `auditd` watch:
 
 ```sh
@@ -81,13 +84,63 @@ And it separates agents from the system cleanly. Measured on one machine:
 `4294967295` is the sentinel for "no login session behind this". So **`auid != unset` is exactly
 'an agent or a human did this'**: no heuristic, no time window, no misattribution.
 
-The intended shape, therefore, is two layers: **auditd is the attribution layer** (who, which
-session, which program) and **the diff is the content layer** (what the file now says). Diff
-alone was never going to be enough.
+The shape, therefore, is two layers: **auditd is the attribution layer** (who, which session,
+which program) and **the diff is the content layer** (what the file now says). Diff alone was
+never going to be enough.
+
+### The verdicts, four of which are admissions
+
+`attribution_for(paths)` returns one of five answers, and only one of them is a claim about a
+person:
+
+| verdict | meaning |
+|---|---|
+| `agent` | at least one write came from a real login session |
+| `system` | writes exist and **every** one came from outside any login session |
+| `none` | the paths are watched and nothing was recorded |
+| `unwatched` | not covered by a watch, so **nothing can be concluded** |
+| `no-audit` | auditd unavailable; this layer has nothing to say |
+
+The `unwatched` case is the one that keeps the rest honest. Absence of a record is only evidence
+when we were actually looking. If missing records meant "the system did it", every path nobody
+thought to watch would be silently excused, and the tool would go quietest exactly where it
+knows least.
+
+`system` is deliberately conservative: a group moves there only if *every* recorded write to it
+lacked a login session. "Watched but nothing recorded" stays charged to the agent, because a
+change that predates the watch, or a rotated log, is not evidence that the OS did it. Inventing
+that would be the same fabrication in the opposite direction.
+
+### Why the raw log and not `ausearch`
+
+Measured on a live VM running auditd 3.1.2: a write appears in `/var/log/audit/audit.log` within
+one second, and `ausearch -k woam` reports `<no matches>` for those same records **forever**,
+while `ausearch --input /var/log/audit/audit.log -k woam` finds them immediately. Its default
+input resolution cannot be relied on.
+
+Shelling out to it would have made woam report "no agent activity" on every machine, silently,
+and looked entirely correct in review. That is the exact confidently-wrong failure the tool
+exists to prevent, so the log is parsed directly. The format is stable and documented; depending
+on that behaviour is not.
+
+### Claims are not evidence
+
+`WOAM_ACTOR` and `CLAUDE_SESSION_ID` are recorded in a `claims` field, never in `by`. Both facts
+are worth having and they are different kinds of thing: the kernel knows the login session but
+cannot know that three agents shared it, while a session id is genuinely useful for finding the
+transcript later. But an identity the subject supplies about itself is a claim, and letting it
+overwrite `by` would mean anything with an environment variable could sign a record as somebody
+else.
+
+The same split applies to sealing: `by` is the audited writer, `sealed_by` is whoever ran
+`woam seal`. Under the PAM hook those are different sessions, and the earlier version recorded
+`by=unknown@plausible` for a write it had complete information about.
 
 Costs, stated rather than hidden: `auditd` is a package and is not installed by default on a
 stock cloud image; watches add kernel overhead proportional to how broadly they are set, so they
-go on the group paths and never on `/`; and the audit log needs rotation.
+are generated from the group paths and never `/`; and the audit log needs rotation. The watch
+list is generated from `GROUPS` rather than hand-written, because a group whose path is not
+watched would report "the system did it" for every agent write to it.
 
 ## What is deliberately not stored
 
