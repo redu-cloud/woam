@@ -208,7 +208,27 @@ t "audit-rules still prints the watches with no auditd installed" "$(has '-k woa
 t "and never watches the whole filesystem" "$(hasnt '-w / -p')"
 
 echo
-echo "[14] house style, checked mechanically because prose never holds"
+echo "[14] the installer's ORDER, which a real first boot proved is not cosmetic"
+# Measured on a fresh VM: with the baseline taken BEFORE the auditd install,
+# installing auditd itself showed up as an unrecorded change and the first `woam` an
+# agent ran on a brand-new machine exited 1 blaming it for woam's own installation.
+# An agent whose first encounter with the tool is a false accusation ignores it after
+# that, and everything else here is then worth nothing.
+INST="$HERE/../install.sh"
+L_AUDIT=$(grep -n 'apt-get .*install -y auditd' "$INST" | head -1 | cut -d: -f1)
+L_BASE=$(grep -n '"\$DEST" baseline' "$INST" | head -1 | cut -d: -f1)
+t "the installer installs auditd before it baselines" \
+  "$([ -n "$L_AUDIT" ] && [ -n "$L_BASE" ] && [ "$L_AUDIT" -lt "$L_BASE" ] && echo 0 || echo 1)" \
+  "auditd at line ${L_AUDIT:-none}, baseline at line ${L_BASE:-none}"
+t "there is exactly one baseline call, so it cannot run early as well" \
+  "$([ "$(grep -c '"\$DEST" baseline' "$INST")" = 2 ] && echo 0 || echo 1)" \
+  "found $(grep -c '"\$DEST" baseline' "$INST") (expected 2: the writable branch and the sudo branch)"
+t "the apt install is bounded by a lock timeout" "$(grep -q 'DPkg::Lock::Timeout' "$INST" && echo 0 || echo 1)"
+t "and a failed auditd install never aborts the installer" \
+  "$(grep -q 'auditd install failed, continuing without attribution' "$INST" && echo 0 || echo 1)"
+
+echo
+echo "[15] house style, checked mechanically because prose never holds"
 # A documented no-em-dash rule was violated 4,237 times across 168 files in the
 # repo this tool came from, by agents that had read the rule. One greppable
 # character; the check takes a second and the document took none.

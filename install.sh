@@ -80,18 +80,6 @@ else
 fi
 say "woam: installed $DEST"
 
-# --- first baseline ------------------------------------------------------------
-# Without one, the very first `woam` says "NO BASELINE" and exits non-zero, which
-# is correct but is a poor first impression of a tool whose job is to be run.
-ROOT="${WOAM_ROOT:-/etc/redu}"
-if mkdir -p "$ROOT" 2>/dev/null && [ -w "$ROOT" ]; then
-  "$DEST" baseline >/dev/null 2>&1 && say "woam: baseline recorded in $ROOT"
-elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-  sudo "$DEST" baseline >/dev/null 2>&1 && say "woam: baseline recorded in $ROOT"
-else
-  say "woam: take the first snapshot with:  sudo woam baseline"
-fi
-
 # --- attribution ---------------------------------------------------------------
 # Without this woam can tell you WHAT changed but not WHO changed it, and it will say so
 # rather than guess. auditd is the only thing on the machine that knows: auid is the login
@@ -115,6 +103,32 @@ if [ "${WOAM_AUDIT:-1}" = "1" ] && [ "$(id -u)" = "0" ]; then
   fi
 elif [ "${WOAM_AUDIT:-1}" = "1" ]; then
   say "woam: not root, skipping attribution setup.  sudo woam audit-install  turns it on."
+fi
+
+# --- first baseline, LAST ------------------------------------------------------
+# The order matters and getting it wrong is not cosmetic. Measured on a real first
+# boot: with the baseline taken BEFORE the auditd install, installing auditd itself
+# then showed up as an unrecorded change, and the very first `woam` an agent ran on
+# a brand-new VM exited 1 blaming it for woam's own installation:
+#
+#     service   vendor(2)     cre /lib/systemd/system/auditd.service
+#     packages  installed(1)  mod /var/lib/dpkg/status
+#
+# That is precisely the failure the "woam runs last in runcmd" rule exists to
+# prevent, reproduced one level down inside the installer. An agent whose first
+# encounter with the tool is a false accusation learns to ignore it, and the whole
+# thing is worth nothing after that.
+#
+# So: baseline once, at the very end, when the machine is actually in its finished
+# state. Without one, the first `woam` says "NO BASELINE" and exits non-zero, which
+# is correct but is a poor first impression of a tool whose job is to be run.
+ROOT="${WOAM_ROOT:-/etc/redu}"
+if mkdir -p "$ROOT" 2>/dev/null && [ -w "$ROOT" ]; then
+  "$DEST" baseline >/dev/null 2>&1 && say "woam: baseline recorded in $ROOT"
+elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  sudo "$DEST" baseline >/dev/null 2>&1 && say "woam: baseline recorded in $ROOT"
+else
+  say "woam: take the first snapshot with:  sudo woam baseline"
 fi
 
 say ""
