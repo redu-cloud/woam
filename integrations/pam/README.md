@@ -1,4 +1,10 @@
-# PAM hooks: making the last write involuntary
+# PAM hooks: session-end sealing (OPT-IN, and not the default)
+
+> **You probably do not need these.** The installer already makes sealing automatic with a
+> systemd timer (`woam seal --grace 600`, every 10 minutes), which carries none of the risk
+> below. Attribution comes from the kernel, so the trigger only has to be automatic, not
+> precise. These hooks buy you exact session-end timing and cost you the possibility of locking
+> a machine out permanently. Take them only if you want that trade deliberately.
 
 `woam note` depends on an agent choosing to explain itself. `woam seal` depends on it choosing
 to run one more command on its way out. These hooks remove the second dependency: PAM fires

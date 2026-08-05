@@ -136,22 +136,40 @@ acquired.
 
 ## Making the last write involuntary
 
-`woam seal` still has to be *called*, which is the same voluntary problem one level up. A PAM
-session-close hook removes that: it fires when the ssh session ends, interactive or not. See
-[`integrations/pam/`](integrations/pam/).
+`woam seal` still has to be *called*, which is the same voluntary problem one level up. The
+installer removes that with a **systemd timer**: `woam seal --grace 600`, every 10 minutes. An
+agent that changes something and walks away still leaves a record naming who did it.
 
-Verified end to end with zero agent cooperation: an agent connected over ssh non-interactively,
-changed an application env file, and exited without recording anything. The hook sealed it by
-itself:
+A timer rather than a PAM `close_session` hook, for two reasons. Attribution comes from the
+kernel now, so the trigger only has to be automatic, not precise; and **editing
+`/etc/pam.d/sshd` can lock a machine out permanently**, with no way back over the network. The
+timer also catches what PAM cannot: sessions that never end, and changes made through an API
+rather than over ssh. The PAM hooks remain in [`integrations/pam/`](integrations/pam/) for
+anyone who wants exact session-end sealing and accepts that risk deliberately.
+
+**Automatic sealing races the agent it is meant to help**, so two things exist to stop it:
+
+- **`--grace 600`.** Without it: an agent edits a file, the timer fires 30 seconds later and
+  records "changed, WHY NOT RECORDED", rebaselines, and the agent's own `woam note` then finds
+  nothing to attach to. The result is a permanent unexplained gap for a change somebody *did*
+  explain. The timestamp comes from the audit record, so it is the real time of the last write,
+  and a held group is deliberately **not** rebaselined: otherwise the window would not be
+  delaying the record, it would be destroying it.
+- **`woam note` closes any gap still open on that group.** The two can cross either way, and a
+  log that keeps "nobody said why" next to a note saying exactly why tells every future reader
+  the machine is less understood than it is.
+
+Measured on a live VM:
 
 ```
-8cc2d8  app: 1 file(s) changed, WHY NOT RECORDED
-        key:env:DISABLE_REGISTRATION changed
+a 2s-old write        holding app (last write 2s ago); still inside the 600s grace window
+agent explains        recorded against app
+                        and closed 3 open gap(s) on app that a seal had left unexplained
+agent walks away      ff7bb1  app: 1 file(s) changed, WHY NOT RECORDED
+                              by ubuntu(auid=1000,ses=274)
 ```
 
-⚠️ **Keep a second ssh session open while editing `/etc/pam.d/sshd`.** A broken PAM stack locks
-you out of the box permanently. The hook is installed `optional` so it can never block a login,
-and `sshd -t` should pass before you trust it.
+`WOAM_TIMER=0` skips installing it.
 
 ## The groups
 
