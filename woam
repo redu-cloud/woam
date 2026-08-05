@@ -130,6 +130,37 @@ GROUPS = {
                           "restarts={{.RestartCount}} state={{.State.Status}}' "
                           "$ids 2>/dev/null; done | sort -u",
             },
+            # INSIDE the containers, without going inside them.
+            #
+            # The obvious idea is to run woam in every container: `docker exec` looks like
+            # ssh, and a Linux container looks like a small VM. Measured on this stack, it
+            # does not work. NONE of keycloak, postgres or the Next.js image ships python3,
+            # so it would mean modifying the customer's images - which this platform
+            # promises never to do. Worse, `/proc/self/loginuid` inside a container reads
+            # 4294967295: there is no login identity in there at all, and auditd is one
+            # subsystem per KERNEL, not per namespace, so the attribution layer cannot
+            # exist inside. And the writable layer is wiped on recreate, so the record
+            # would not even survive.
+            #
+            # The host can already see in. `docker diff` lists what a container's writable
+            # layer holds that its IMAGE does not - the same question as
+            # `ostree admin config-diff`: what here is not stock? No install, no image
+            # change, read-only, and measured at 1.5s for three containers.
+            #
+            # Combined with the audited `docker exec` (who went in, and with what argv),
+            # that gives the whole picture: WHO entered, WHAT they ran, WHAT changed.
+            #
+            # Volume data is deliberately absent: it lives in a mount, not the writable
+            # layer. That is the flood we already refused to watch.
+            "container_fs": {
+                "paths": [], "budget": 600,
+                "derive": "for e in podman docker; do command -v $e >/dev/null 2>&1 || continue; "
+                          "for c in $($e ps --format '{{.Names}}' 2>/dev/null | head -20); do "
+                          "$e diff \"$c\" 2>/dev/null | "
+                          "grep -vE ' (/tmp|/run|/proc|/sys|/dev|/var/log|/var/run|/var/tmp|/var/cache|/var/lib/(dpkg|apt|rpm))(/|$)' | "
+                          "grep -vE 'hsperfdata|vertx-cache|transaction-logs|\\.pid$|\\.lock$|\\.sock$' | "
+                          "sed \"s|^|$c |\"; done; done | sort -u",
+            },
             "images": {
                 "paths": [], "budget": 200,
                 "derive": "{ podman images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null; "
