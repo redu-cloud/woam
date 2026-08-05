@@ -92,8 +92,17 @@ GROUPS = {
             # broken app's own files mapped to host/other and `woam show app` saw nothing -
             # found 2026-08-05 by an agent fixing a real incident, where woam reported
             # "all groups recorded" while the app was down.
+            # audit: False. This is the RUNNING application's own tree, and an app that keeps
+            # a SQLite file, a log, an upload directory or a cache under it writes here
+            # constantly. A recursive audit watch would emit a record per write, fill
+            # /var/log/audit, and trigger auditd's rotation (8MB x 5 by default), which
+            # silently shortens the attribution history for EVERY OTHER group to minutes.
+            # Losing attribution everywhere to gain it here is a bad trade, and the failure
+            # would be invisible. Change detection still covers this tree; only the audit
+            # watch is off. Turn it on deliberately with WOAM_AUDIT_APP_SOURCE=1 once you
+            # have measured the write volume of the app in question.
             "source": {"paths": ["/opt/app", "/opt/app-src", "/opt/redu-deploy",
-                                 "/opt/redu-compose"], "budget": 3000},
+                                 "/opt/redu-compose"], "budget": 3000, "audit": False},
         },
         "probe": [("containers", "podman ps --format '{{.Names}} {{.Status}}' 2>/dev/null || docker ps 2>/dev/null"),
                   ("images", "podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -5")],
@@ -432,9 +441,23 @@ def audit_rules_text() -> str:
         "# -p wa = write + attribute change. Narrow watches only: never -w /.",
     ]
     seen = set()
-    for _g, _s, si in all_subs():
+    audit_source = os.environ.get("WOAM_AUDIT_APP_SOURCE") == "1"
+    for _g, sname, si in all_subs():
+        if si.get("audit") is False and not (sname == "source" and audit_source):
+            continue                       # bulk trees: see the note in GROUPS
         for p in si["paths"]:
-            p = p.split("*")[0].rstrip("/") if "*" in p else p
+            if "*" in p:
+                # auditctl has no globs, and truncating at the '*' is how
+                # /home/*/.ssh/authorized_keys became `-w /home`: a recursive watch on
+                # every home directory, which is exactly where agents clone repos and
+                # build. Expand to the files that actually exist instead. A home created
+                # later is simply not watched, which `woam who` reports as "unwatched"
+                # rather than pretending to know.
+                for real in sorted(glob.glob(p)):
+                    if real not in seen:
+                        seen.add(real)
+                        lines.append(f"-w {real} -p wa -k {AUDIT_KEY}")
+                continue
             if not p or p in seen:
                 continue
             seen.add(p)

@@ -130,8 +130,25 @@ t("NEVER -w / (audit overhead is proportional to breadth)",
   not any(l.startswith("-w / ") or l.strip() == "-w / -p wa -k woam" for l in rules.splitlines()))
 t("all watches carry the woam key", all("-k woam" in l for l in rules.splitlines() if l.startswith("-w")))
 t("covers the group paths", "-w /etc/redu-app -p wa -k woam" in rules)
-t("glob roots are reduced to a literal stem auditctl accepts",
-  not any("*" in l for l in rules.splitlines()))
+t("no globs survive: auditctl has none", not any("*" in l for l in rules.splitlines()))
+
+# The two that nearly shipped. Both flood the audit log, and the damage is not local:
+# auditd rotates at 8MB x 5 by default, so a hot watch silently shortens the attribution
+# history for EVERY OTHER group to minutes. A failure that quietly disables the feature
+# everywhere is worse than one that breaks loudly in one place.
+watched = [l.split()[1] for l in rules.splitlines() if l.startswith("-w ")]
+t("NEVER a recursive watch on /home - agents clone and build there",
+  "/home" not in watched, str([w for w in watched if w.startswith("/home")]))
+t("a home key file is watched by its real path instead",
+  all(w == "/home" or "/.ssh/" in w for w in watched if w.startswith("/home")),
+  str([w for w in watched if w.startswith("/home")]))
+t("NEVER a recursive watch on the app's own tree - it writes there at runtime",
+  "/opt/app" not in watched and "/opt/app-src" not in watched, str(watched))
+t("but the app's compose FILES are still watched (config, not runtime)",
+  any(w.startswith("/opt/app/") for w in watched), str([w for w in watched if w.startswith("/opt/")]))
+t("every watch is an absolute path", all(w.startswith("/") for w in watched))
+t("no watch is a bare top-level directory", all(w.count("/") >= 2 for w in watched),
+  str([w for w in watched if w.count("/") < 2]))
 
 print("\n[6] this process's own login identity, free from the kernel")
 auid, ses = m.self_login()
