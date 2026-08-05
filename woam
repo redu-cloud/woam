@@ -35,6 +35,7 @@ No dependencies beyond the Python 3 standard library. Runs on a redu VM, on a
 plain Ubuntu box, or on a laptop.
 """
 
+import binascii
 import glob
 import hashlib
 import json
@@ -84,7 +85,24 @@ GROUPS = {
         "subs": {
             # tiny + high value: never capped, always fully hashed
             "unit":   {"paths": ["/etc/containers/systemd"], "budget": 200},
-            "env":    {"paths": ["/etc/redu-app"], "budget": 200, "keys": True},
+            # The app's env files, WATCHED and key-diffed, even though the trees they sit
+            # in are not (see `source`, audit: False).
+            #
+            # /opt/app-src/.env is where deploy_compose puts the stack's secrets, and it is
+            # the single most consequential file on a compose VM. It sat inside `source`,
+            # so it had content detection but NO attribution - and a real incident on
+            # 2026-08-05 proved the cost: an agent mangled POSTGRES_PASSWORD there, took
+            # Keycloak down, and woam recorded `mod:source:/opt/app-src/.env` with
+            # `by=root@redu-dojo, evidence=unwatched`. It knew WHAT and WHEN and could not
+            # say WHO, because I had switched the watch off for the whole tree to avoid a
+            # log flood.
+            #
+            # A config FILE is not the bulk tree it lives in. Same distinction already made
+            # for /opt/app/docker-compose.yml: watch the file, not the directory.
+            "env":    {"paths": ["/etc/redu-app",
+                                 "/opt/app-src/.env", "/opt/app/.env",
+                                 "/opt/redu-compose/.env", "/opt/redu-deploy/.env"],
+                       "budget": 200, "keys": True},
             "compose": {"paths": ["/opt/redu-compose", "/opt/app/docker-compose.yml",
                                   "/opt/app/compose.yaml", "/opt/app/docker-compose.yaml"], "budget": 200},
             # bulk: capped, changes here are usually a deploy rather than an edit
@@ -360,6 +378,22 @@ AUDIT_CMDS = ["docker", "podman", "systemctl", "podman-compose", "docker-compose
 # verb is treated as state-changing, so a new subcommand errs towards demanding a record
 # rather than silently excusing one. Falsely blaming an agent costs a junk note; falsely
 # excusing one loses the record entirely, which is the failure that matters.
+# Commands that are read-only BY THEMSELVES, where the verb test cannot help. The
+# subcommand filter below works for `docker ps` and `systemctl status`, but sudo's
+# USER_CMD records catch everything an agent ran privileged - `find`, `cat`, `grep` - and
+# argv[1] there is a path, not a verb. Measured on a real incident: 45 "state-changing"
+# commands, of which about a third were somebody reading files.
+#
+# Attaching 45 lines to one gap makes the record unreadable, and an unreadable record is
+# an unused one; practitioners put the bar at fewer than 50 nodes for a whole alert.
+AUDIT_READONLY_CMDS = {
+    "cat", "ls", "find", "grep", "egrep", "fgrep", "zgrep", "tail", "head", "less", "more",
+    "stat", "df", "du", "ps", "top", "wc", "file", "readlink", "realpath", "which",
+    "whereis", "id", "whoami", "uname", "uptime", "free", "date", "echo", "printf",
+    "journalctl", "dmesg", "ss", "netstat", "hostname", "env", "printenv", "diff", "md5sum",
+    "sha256sum", "getent", "lsblk", "lsof", "pgrep", "test",
+}
+
 AUDIT_READONLY_VERBS = {
     "ps", "inspect", "images", "image", "logs", "log", "stats", "top", "version", "info",
     "ls", "list", "events", "port", "history", "search", "diff", "df", "wait",
@@ -550,6 +584,59 @@ def audit_writes(since_epoch: float = 0.0, key: str = AUDIT_KEY, limit: int = 40
     return [events[s] for s in order[-limit:]]
 
 
+# Secrets travel on command lines, so capturing argv means capturing secrets unless you
+# stop it. Measured on a real machine the moment USER_CMD parsing was switched on:
+#
+#   docker exec -e PGPASSWORD=uLK7VpDeVytHk9yNQUmSh6ezH7oX redu-dojo-db-1 psql ...
+#
+# That is the live database password, and woam was one step from copying it into
+# /etc/redu/changes.jsonl - a file whose stated promise is that secrets never enter it.
+# The audit log already contains this (that is auditd's business, not ours); woam must not
+# duplicate it into a second, longer-lived place.
+#
+# Redact at WRITE, never filter at read: a value that never enters the record cannot leak
+# from it later.
+_SECRETISH = re.compile(
+    r"(?i)^(-{0,2}[A-Za-z0-9_.-]*"
+    r"(?:pass(?:word|wd)?|secret|token|key|credential|apikey|auth|pwd)"
+    r"[A-Za-z0-9_.-]*)=(.+)$")
+_SECRET_FLAGS = re.compile(r"(?i)^--?(p|pass|passwd|password|secret|token|key|apikey|auth)$")
+
+
+def redact_argv(argv):
+    """Mask secret-shaped arguments, keeping the SHAPE of the command intact.
+
+    The record's value is "an agent ran docker exec with a password env var", not the
+    password itself. Names, never values - the same rule the env-file hashing follows.
+    """
+    out, mask_next = [], False
+    for a in argv:
+        if mask_next:
+            out.append("<redacted>")
+            mask_next = False
+            continue
+        # A header value arrives split across argv, so `-H "Authorization: Bearer eyJ..."`
+        # becomes three tokens and the flag test never sees the secret. Catch the token
+        # itself: `Bearer` marks the next one, and a JWT is recognisable on its own.
+        if a.lower() in ("bearer", "authorization:", "authorization"):
+            out.append(a)
+            mask_next = True
+            continue
+        if re.match(r"^eyJ[A-Za-z0-9_-]{10,}", a) or re.match(r"^(gh[pousr]|sk|xox[baprs])[-_][A-Za-z0-9]{16,}", a):
+            out.append("<redacted>")
+            continue
+        m = _SECRETISH.match(a)
+        if m:
+            out.append(f"{m.group(1)}=<redacted>")
+            continue
+        if _SECRET_FLAGS.match(a):
+            out.append(a)
+            mask_next = True
+            continue
+        out.append(a)
+    return out
+
+
 def audit_commands(since_epoch: float = 0.0, limit: int = 500):
     """State-changing commands run BY A LOGIN SESSION since `since_epoch`.
 
@@ -576,6 +663,42 @@ def audit_commands(since_epoch: float = 0.0, limit: int = 500):
                     if ts < since_epoch:
                         continue
                     serial, typ, rest = m.group("serial"), m.group("t"), m.group("rest")
+                    # sudo's OWN record, which costs us nothing and needs no rule.
+                    #
+                    # Every `sudo` invocation emits USER_CMD with auid, ses, cwd and the
+                    # full command hex-encoded, on any machine running auditd. Found the
+                    # hard way: after a real incident, woam could not attribute a change
+                    # to /opt/app-src/.env because that path was unwatched - and the
+                    # kernel had recorded the whole thing anyway:
+                    #
+                    #   15:49:08 auid=1000 ses=7 cwd=/opt/app-src
+                    #            docker compose ... up -d --force-recreate keycloak
+                    #
+                    # This works on paths woam does not watch and on machines where
+                    # audit-install never ran, so it is the widest attribution source of
+                    # the three. It only sees what went through sudo, which on these VMs
+                    # is how an agent does anything privileged.
+                    if typ == "USER_CMD":
+                        auid = _nfield(rest, "auid")
+                        if auid is None or auid == AUID_UNSET or auid < 0:
+                            continue
+                        m2 = re.search(r"\bcmd=([0-9A-Fa-f]{6,})", rest)
+                        argv = []
+                        if m2:
+                            try:
+                                argv = binascii.unhexlify(m2.group(1)).decode("utf-8", "replace").split()
+                            except Exception:
+                                argv = []
+                        if not argv:
+                            raw = re.search(r"\bcmd=(\S+)", rest)
+                            argv = raw.group(1).split() if raw else []
+                        if serial not in evs:
+                            order.append(serial)
+                        evs[serial] = {"ts": ts, "auid": auid, "ses": _nfield(rest, "ses"),
+                                       "exe": _qfield(rest, "cwd") or "sudo",
+                                       "argv": redact_argv(argv)}
+                        continue
+
                     if typ == "SYSCALL" and AUDIT_CMD_KEY in _qfields(rest, "key"):
                         auid = _nfield(rest, "auid")
                         if auid is None or auid == AUID_UNSET or auid < 0:
@@ -588,7 +711,7 @@ def audit_commands(since_epoch: float = 0.0, limit: int = 500):
                         # a0="docker" a1="restart" a2="name"
                         args = re.findall(r'\ba\d+="([^"]*)"', rest)
                         if args:
-                            evs[serial]["argv"] = args
+                            evs[serial]["argv"] = redact_argv(args)
     except Exception:
         return []
     out = []
@@ -596,6 +719,17 @@ def audit_commands(since_epoch: float = 0.0, limit: int = 500):
         e = evs[s]
         # Drop read-only invocations, including woam's own probes. A command that cannot
         # change anything is not evidence that something was changed.
+        if not e["argv"]:
+            out.append(e)
+            continue
+        prog = os.path.basename(e["argv"][0])
+        # `sed`/`awk`/`perl` only write with -i. Without it they are readers, and after a
+        # real incident the log was full of `sed -n '...' file` reconnaissance.
+        if prog in ("sed", "awk", "perl") and not any(
+                a == "-i" or a.startswith("-i") for a in e["argv"][1:]):
+            continue
+        if prog in AUDIT_READONLY_CMDS:
+            continue
         verb = next((a for a in e["argv"][1:] if not a.startswith("-")), None)
         if verb and verb in AUDIT_READONLY_VERBS:
             continue

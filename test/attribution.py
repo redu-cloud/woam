@@ -289,5 +289,37 @@ auid, ses = m.self_login()
 t("loginuid is readable without auditd installed", auid is not None, str(auid))
 t("sessionid too", ses is not None, str(ses))
 
+
+print("\n[8] secrets must never enter the record")
+# Capturing argv means capturing secrets unless you stop it. Measured the moment USER_CMD
+# parsing was switched on, on a real machine:
+#   docker exec -e PGPASSWORD=uLK7VpDeVytHk9yNQUmSh6ezH7oX redu-dojo-db-1 psql ...
+# That is the live database password, one step from being copied into changes.jsonl - a
+# file whose stated promise is that secrets never enter it. Redact at WRITE: a value that
+# never enters the record cannot leak from it later.
+_R = m.redact_argv
+_cases = [
+    (["docker", "exec", "-e", "PGPASSWORD=uLK7VpDeVytHk9yNQUmSh6ezH7oX", "db"], "uLK7VpDeVytHk9yNQUmSh6ezH7oX"),
+    (["mysql", "-u", "root", "-p", "hunter2"], "hunter2"),
+    (["kcadm.sh", "--password", "admin123", "--server", "x"], "admin123"),
+    (["curl", "-H", "Authorization:", "Bearer", "eyJhbGciOiJIUzI1NiJ9abc"], "eyJhbGciOiJIUzI1NiJ9abc"),
+    (["gh", "auth", "login", "--with-token", "ghp_AbCdEfGh0123456789xyz"], "ghp_AbCdEfGh0123456789xyz"),
+    (["app", "--api-key=sk_live_0123456789abcdef"], "sk_live_0123456789abcdef"),
+]
+for argv, secret in _cases:
+    got = " ".join(_R(argv))
+    t(f"redacted: {argv[0]} {argv[1] if len(argv) > 1 else ''}".strip(), secret not in got, got[:70])
+
+t("the SHAPE of the command survives redaction",
+  " ".join(_R(["docker", "exec", "-e", "PGPASSWORD=x123456", "db", "psql"]))
+  == "docker exec -e PGPASSWORD=<redacted> db psql")
+t("a command with no secret is untouched",
+  _R(["docker", "compose", "up", "-d", "--force-recreate", "keycloak"])
+  == ["docker", "compose", "up", "-d", "--force-recreate", "keycloak"])
+# The line that made this whole feature worth having must survive.
+t("the incident command is still legible",
+  " ".join(_R(["sed", "-i", "s/^POSTGRES_PASSWORD=/POSTGRES_PASSWORD=Z/", ".env"]))
+  .startswith("sed -i s/^POSTGRES_PASSWORD="))
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
