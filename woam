@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 redu.cloud
+#
+# The licence lives in the FILE, not only in the repo, because this file is
+# delivered on its own: `curl https://redu.cloud/woam` lands one script on a
+# machine with no LICENSE next to it and no repository to look in. A recipient
+# who cannot tell what they are allowed to do with it has to assume the answer
+# is "nothing".
 """
 woam - machine memory for redu.cloud.
 

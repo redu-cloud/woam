@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 redu.cloud
 # woam installer.
 #
 #   curl -fsSL https://redu.cloud/woam-install.sh | sh

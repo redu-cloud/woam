@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 redu.cloud
 # PAM close_session hook: seal the session when the agent leaves.
 #
 # `woam seal` still has to be CALLED, which is the same voluntary problem one

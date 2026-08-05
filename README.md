@@ -164,3 +164,16 @@ that must never report "clean": a fresh install with no baseline, and an unrecor
 `bash publish.sh` copies the tool, its checksum and the installer into the marketing site's
 `public/` directory, which is what serves `https://redu.cloud/woam`. It refuses to run if the
 smoke test fails.
+
+**This repository is private, so the install URL is the only delivery path.** There is no raw
+GitHub fallback and the installer must never grow one: it would ask every machine for a
+credential it has no business holding.
+
+## Licence
+
+MIT. See [`LICENSE`](LICENSE).
+
+The distributed files carry an `SPDX-License-Identifier` in their own headers, not only in this
+repository. `curl https://redu.cloud/woam` lands a single script on a machine with no `LICENSE`
+beside it and no repository to look in, and a recipient who cannot tell what they are permitted
+to do with a file has to assume the answer is nothing.

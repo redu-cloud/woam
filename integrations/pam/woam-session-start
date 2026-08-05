@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 redu.cloud
 # PAM open_session hook: snapshot state at login.
 #
 # The pair of this and woam-session-end is what makes the seal report ONLY what
