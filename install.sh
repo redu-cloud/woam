@@ -164,6 +164,23 @@ UNIT
   fi
 fi
 
+# --- tell the agent this exists -------------------------------------------------
+# A record nobody knows about is worth nothing. Measured 2026-08-05: woam sealed the
+# exact file behind a live outage 17 seconds after it began, and the responding agent
+# diagnosed the incident from container logs and never ran `woam`, because nothing on
+# the machine mentioned it. The answer was already written down and went unread.
+#
+# `woam banner`, not `woam status`: status walks the container layer and costs over a
+# second, and something that slow on every shell gets deleted within a week. The banner
+# reads one file.
+if [ "$(id -u)" = "0" ] && [ -d /etc/profile.d ]; then
+  cat >/etc/profile.d/woam.sh <<'PROF'
+# Printed at login. Never fails a login: every failure path is swallowed.
+command -v woam >/dev/null 2>&1 && woam banner 2>/dev/null || true
+PROF
+  chmod 0644 /etc/profile.d/woam.sh
+fi
+
 # --- first baseline, LAST ------------------------------------------------------
 # The order matters and getting it wrong is not cosmetic. Measured on a real first
 # boot: with the baseline taken BEFORE the auditd install, installing auditd itself

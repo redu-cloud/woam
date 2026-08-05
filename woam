@@ -1582,6 +1582,41 @@ def cmd_which(argv) -> int:
     return 0
 
 
+def cmd_banner(argv) -> int:
+    """The three lines an agent sees on login. FAST and never a full scan.
+
+    A record nobody knows about is worth nothing, and that is not hypothetical. Measured
+    2026-08-05: an agent corrupted a live .env, keycloak entered a restart loop, and woam
+    sealed `mod:source:/opt/app-src/.env` SEVENTEEN SECONDS after the outage began. A
+    second agent then diagnosed the incident from container logs and never ran `woam`,
+    because nothing on the machine mentioned it. The answer existed, sat unread, and the
+    responder paid to re-derive it.
+
+    So: printed at login, and deliberately NOT `woam status` - status now walks the
+    container layer and costs over a second, which on every shell would get this deleted
+    within a week. This reads one file and counts.
+    """
+    print(BANNER)
+    try:
+        entries = read_log()
+    except Exception:
+        return 0
+    closed = {e.get("id") for e in entries if e.get("ev") == "gap_closed"}
+    gaps = [e for e in entries if e.get("ev") == "gap" and e.get("id") not in closed]
+    notes = [e for e in entries if e.get("ev") in ("note", "claim")]
+    if gaps:
+        # The most recent unexplained change, named. This is the line that would have
+        # ended the incident above in one read instead of a log-reading expedition.
+        last = gaps[-1]
+        what = (last.get("what") or ["?"])[0]
+        print(f"  {len(gaps)} UNEXPLAINED change(s) on this machine. Most recent:")
+        print(f"    {last.get('ts')}  {last.get('group')}  {what}")
+        print(f"    woam gaps   to see them all")
+    elif notes:
+        print(f"  {len(notes)} recorded change(s). `woam show <group>` before you debug.")
+    return 0
+
+
 def cmd_claim(argv) -> int:
     """Record a change you made to a machine FROM OUTSIDE it.
 
@@ -1836,7 +1871,7 @@ COMMANDS = {
     "status": cmd_status, "show": cmd_show, "note": cmd_note, "fix": cmd_fix,
     "gaps": cmd_gaps, "log": cmd_log, "groups": cmd_groups, "which": cmd_which,
     "seal": cmd_seal, "why": cmd_why, "session-open": cmd_session_open,
-    "who": cmd_who, "claim": cmd_claim, "accept": cmd_accept, "audit-rules": cmd_audit_rules, "audit-status": cmd_audit_status,
+    "who": cmd_who, "banner": cmd_banner, "claim": cmd_claim, "accept": cmd_accept, "audit-rules": cmd_audit_rules, "audit-status": cmd_audit_status,
     "audit-install": cmd_audit_install,
     "baseline": lambda a: (rebaseline(a or None), print("baseline recorded"), 0)[-1],
 }
