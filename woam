@@ -302,6 +302,39 @@ def claimed_actor():
 # ---------------------------------------------------------------------------
 AUID_UNSET = 4294967295          # kernel sentinel for "no login session behind this"
 AUDIT_KEY = "woam"
+AUDIT_CMD_KEY = "woam-cmd"
+
+# Commands that CHANGE the machine and leave no trace in a config file. An agent runs
+# `docker restart`, `systemctl stop`, `podman rm` - the container layer moves, nothing on
+# disk does, and a filesystem watch sees none of it.
+#
+# Auditing the EXECUTION answers the question a file watch cannot: not "did the state
+# change" but "did an agent change it". A container that came back because of
+# restart:unless-stopped, an OOM kill, or a healthcheck moves exactly the same state and
+# runs no command from a login session. That difference is the whole requirement.
+#
+# The `-F auid!=unset` predicate is applied IN THE KERNEL, so the engine's own daemon
+# activity never generates a record at all. Volume stays near zero, which is why this can
+# be on by default.
+AUDIT_CMDS = ["docker", "podman", "systemctl", "podman-compose", "docker-compose",
+              "kcadm.sh", "psql", "mysql", "apt-get", "apt", "dnf", "yum"]
+
+# Subcommands that CANNOT have changed anything. woam's own container probes are
+# `docker ps` and `docker inspect`, and those are audited like any other execution - so
+# without this the tool reports ITSELF as the agent that restarted a container, on every
+# single run. Measured: a restart the engine performed by itself came back attributed to
+# `ubuntu(auid=1000)` with `RAN docker ps -aq`, which is woam's own inspection.
+#
+# An explicit read-only list rather than a mutating list, deliberately. An unrecognised
+# verb is treated as state-changing, so a new subcommand errs towards demanding a record
+# rather than silently excusing one. Falsely blaming an agent costs a junk note; falsely
+# excusing one loses the record entirely, which is the failure that matters.
+AUDIT_READONLY_VERBS = {
+    "ps", "inspect", "images", "image", "logs", "log", "stats", "top", "version", "info",
+    "ls", "list", "events", "port", "history", "search", "diff", "df", "wait",
+    "is-active", "is-enabled", "is-failed", "is-system-running", "show", "status",
+    "list-units", "list-timers", "list-unit-files", "cat", "get-default", "show-environment",
+}
 AUDIT_LOG = Path(os.environ.get("WOAM_AUDIT_LOG", "/var/log/audit/audit.log"))
 AUDIT_RULES = Path(os.environ.get("WOAM_AUDIT_RULES", "/etc/audit/rules.d/woam.rules"))
 
@@ -354,6 +387,21 @@ def _nfield(rest: str, name: str):
     """A numeric audit field: auid=1000. Returns None if absent or not a number."""
     m = re.search(r"\b%s=(-?\d+)\b" % re.escape(name), rest)
     return int(m.group(1)) if m else None
+
+
+def _audit_log_files():
+    """The current log AND its rotations, oldest first.
+
+    Reading only audit.log was wrong: the default is 8MB x 5, which on a busy machine is
+    minutes of history, and woam's own watches can push the rotation. `ausearch` has
+    --input-logs for exactly this reason. Missing the rotated files makes "no write
+    recorded" mean "I did not look far enough back".
+    """
+    try:
+        rotated = sorted(AUDIT_LOG.parent.glob(AUDIT_LOG.name + ".*"), reverse=True)
+    except Exception:
+        rotated = []
+    return [p for p in rotated + [AUDIT_LOG] if p.exists() and os.access(str(p), os.R_OK)]
 
 
 def audit_available():
@@ -413,7 +461,8 @@ def audit_writes(since_epoch: float = 0.0, key: str = AUDIT_KEY, limit: int = 40
         return []
     events, order = {}, []
     try:
-        with AUDIT_LOG.open("r", errors="replace") as fh:
+      for _lf in _audit_log_files():
+        with _lf.open("r", errors="replace") as fh:
             for line in fh:
                 m = _AUDIT_HEAD.match(line)
                 if not m:
@@ -468,6 +517,59 @@ def audit_writes(since_epoch: float = 0.0, key: str = AUDIT_KEY, limit: int = 40
     except Exception:
         return []
     return [events[s] for s in order[-limit:]]
+
+
+def audit_commands(since_epoch: float = 0.0, limit: int = 500):
+    """State-changing commands run BY A LOGIN SESSION since `since_epoch`.
+
+    This is what makes "only what the agent did" enforceable on state that is not a file.
+    A container restarted by `docker restart` from an ssh session records an execve with
+    auid=1000; the same container restarted by its own restart policy, an OOM kill or a
+    failed healthcheck records nothing, because the kernel rule filters auid!=unset before
+    anything is written.
+
+    Returns [{ts, auid, ses, exe, argv}], newest last.
+    """
+    ok, _ = audit_available()
+    if not ok:
+        return []
+    evs, order = {}, []
+    try:
+        for path in _audit_log_files():
+            with path.open("r", errors="replace") as fh:
+                for line in fh:
+                    m = _AUDIT_HEAD.match(line)
+                    if not m:
+                        continue
+                    ts = float(m.group("ts"))
+                    if ts < since_epoch:
+                        continue
+                    serial, typ, rest = m.group("serial"), m.group("t"), m.group("rest")
+                    if typ == "SYSCALL" and AUDIT_CMD_KEY in _qfields(rest, "key"):
+                        auid = _nfield(rest, "auid")
+                        if auid is None or auid == AUID_UNSET or auid < 0:
+                            continue          # belt and braces; the kernel already filtered
+                        if serial not in evs:
+                            order.append(serial)
+                        evs[serial] = {"ts": ts, "auid": auid, "ses": _nfield(rest, "ses"),
+                                       "exe": _qfield(rest, "exe"), "argv": []}
+                    elif typ == "EXECVE" and serial in evs:
+                        # a0="docker" a1="restart" a2="name"
+                        args = re.findall(r'\ba\d+="([^"]*)"', rest)
+                        if args:
+                            evs[serial]["argv"] = args
+    except Exception:
+        return []
+    out = []
+    for s in order:
+        e = evs[s]
+        # Drop read-only invocations, including woam's own probes. A command that cannot
+        # change anything is not evidence that something was changed.
+        verb = next((a for a in e["argv"][1:] if not a.startswith("-")), None)
+        if verb and verb in AUDIT_READONLY_VERBS:
+            continue
+        out.append(e)
+    return out[-limit:]
 
 
 def attribution_for(paths, since_epoch: float = 0.0):
@@ -525,6 +627,14 @@ def audit_rules_text() -> str:
         "# GENERATED by `woam audit-rules`. Do not edit; edit the GROUPS table in woam.",
         "# -p wa = write + attribute change. Narrow watches only: never -w /.",
     ]
+    # Execution rules FIRST: they answer "did an agent do this", which a file watch cannot.
+    # auid!=unset is evaluated in the kernel, so a daemon's own work never records.
+    for c in AUDIT_CMDS:
+        p = sh(f"command -v {c} 2>/dev/null")
+        if p:
+            for arch in ("b64", "b32"):
+                lines.append(f"-a always,exit -F arch={arch} -F path={p} -F perm=x "
+                             f"-F auid!=unset -k {AUDIT_CMD_KEY}")
     seen = set()
     audit_source = os.environ.get("WOAM_AUDIT_APP_SOURCE") == "1"
     for _g, sname, si in all_subs():
@@ -952,11 +1062,34 @@ def classify_dirty(dirty: dict):
             for kind in ("modified", "created", "removed"):
                 paths.extend(dd.get(kind) or [])
         if derived_only:
-            # Engine-reported state. We know exactly WHAT changed and the actor is not
-            # recoverable from a file watch. The agent still owes the WHY - that is the
-            # whole point of catching it.
-            d["verdict"], d["actors"], d["last_write"] = "derived", [], None
-            agent[name] = d
+            # State changed with no file behind it. The question is not "what changed" -
+            # we have that - but "did an AGENT change it". A container restarted by
+            # `docker restart` from a login session is the agent's doing and needs a
+            # record; the same container brought back by restart:unless-stopped, an OOM
+            # kill or a failed healthcheck moves identical state and is not.
+            #
+            # The kernel already answered it: a state-changing command run from a login
+            # session recorded an execve with auid set, and the daemon's own work
+            # recorded nothing because auid!=unset is filtered before the write.
+            cmds = audit_commands(epoch_of(d.get("since", "")))
+            if cmds:
+                d["verdict"] = "agent"
+                d["actors"] = sorted({f"{uid_name(c['auid'])}(auid={c['auid']},ses={c['ses']})"
+                                      for c in cmds})
+                d["commands"] = [" ".join(c["argv"])[:120] for c in cmds if c["argv"]][-3:]
+                d["last_write"] = max(c["ts"] for c in cmds)
+                agent[name] = d
+            else:
+                ok, _why = audit_available()
+                if ok:
+                    # Nothing ran from a login session. The engine did this to itself.
+                    d["verdict"], d["actors"], d["last_write"] = "system", [], None
+                    system[name] = d
+                else:
+                    # Without attribution we cannot tell the two apart, and guessing
+                    # "the engine did it" would excuse an agent from its own record.
+                    d["verdict"], d["actors"], d["last_write"] = "derived", [], None
+                    agent[name] = d
             continue
         verdict, actors, ev = attribution_for(paths, epoch_of(d.get("since", "")))
         d["verdict"], d["actors"] = verdict, actors
@@ -1010,6 +1143,8 @@ def cmd_status(argv) -> int:
             v, actors = d.get("verdict"), d.get("actors") or []
             if v == "agent":
                 print(f"    {'':9s}   BY   {', '.join(actors)}")
+                for c in (d.get("commands") or []):
+                    print(f"    {'':9s}   RAN  {c}")
             elif v == "none":
                 print(f"    {'':9s}   BY   unrecorded - the change predates the watch, or the log rotated")
             elif v == "derived":
@@ -1492,11 +1627,16 @@ def cmd_audit_install(argv) -> int:
     # blind window nobody remembers to close.
     loaded, failed = 0, 0
     for line in audit_rules_text().splitlines():
-        if not line.startswith("-w"):
+        # BOTH kinds. The loader used to take only `-w` lines, so the exec rules were
+        # written to the file and never put in force - and woam then saw no command behind
+        # a container restart and concluded the ENGINE had done it. A rule that exists on
+        # disk and not in the kernel is worse than no rule: it reads as coverage.
+        if not (line.startswith("-w ") or line.startswith("-a ")):
             continue
-        path = line.split()[1]
-        if not Path(path).exists():
-            continue                      # auditctl refuses a watch on a missing path
+        if line.startswith("-w "):
+            path = line.split()[1]
+            if not Path(path).exists():
+                continue                  # auditctl refuses a watch on a missing path
         r = subprocess.run(["auditctl"] + line.split(), capture_output=True, text=True)
         loaded += 1 if r.returncode == 0 else 0
         failed += 0 if r.returncode == 0 else 1

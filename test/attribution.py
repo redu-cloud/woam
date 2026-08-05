@@ -23,6 +23,7 @@ Every assertion here is about NOT LYING:
 Run: python3 test/attribution.py     (no root, no auditd, no network)
 """
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -125,7 +126,61 @@ t("with attribution OFF nothing is excused as 'the system did it'",
 
 print("\n[5] the watches are generated from GROUPS, so they cannot drift")
 rules = m.audit_rules_text()
-t("every rule is a narrow -w watch", all(l.startswith("-w ") for l in rules.splitlines() if not l.startswith("#")))
+_rl = [l for l in rules.splitlines() if l and not l.startswith("#")]
+t("every rule is either a narrow -w watch or an exec rule",
+  all(l.startswith("-w ") or l.startswith("-a always,exit ") for l in _rl),
+  str([l for l in _rl if not (l.startswith("-w ") or l.startswith("-a always,exit "))][:2]))
+
+# The exec rules are what answer "did an AGENT do this" for state with no file behind it.
+# auid!=unset must be in the KERNEL predicate: it is what stops a daemon's own work from
+# being recorded at all, which is both the correctness property and the volume control.
+_ex = [l for l in _rl if l.startswith("-a always,exit ")]
+t("exec rules exist for the state-changing commands", len(_ex) > 0, str(len(_ex)))
+t("EVERY exec rule filters auid!=unset in the kernel",
+  all("-F auid!=unset" in l for l in _ex),
+  str([l for l in _ex if "-F auid!=unset" not in l][:1]))
+t("every exec rule is -F perm=x on a resolved absolute path",
+  all("-F perm=x" in l and re.search(r"-F path=/", l) for l in _ex))
+t("exec rules carry their own key, so they never mix with file writes",
+  all(f"-k {m.AUDIT_CMD_KEY}" in l for l in _ex))
+
+print("\n[5b] a change with no command behind it is the engine's, not the agent's")
+# This is the requirement in one assertion: identical container state movement, but only
+# the one preceded by a login-session command is the agent's to explain.
+_dirty_derived = {"app": {"since": "1970-01-01T00:00:00Z", "subs": [("containers", 1)],
+    "files": 1, "named": {"containers": {"modified": ["/x img=y started=z"],
+                                         "created": [], "removed": []}}}}
+_noaudit = load(None, RULES)          # attribution off entirely
+agN, sysN = _noaudit.classify_dirty({k: dict(v) for k, v in _dirty_derived.items()})
+t("with attribution OFF a derived change is NOT excused as the engine's",
+  "app" in agN and sysN == {}, f"agent={list(agN)} system={list(sysN)}")
+
+_quiet = Path(_tf.mkdtemp()) / "nocmds.log" if False else None
+import tempfile as _t2
+_q = Path(_t2.mkdtemp()) / "quiet.log"
+_q.write_text('type=SYSCALL msg=audit(1785930231.9:1): arch=c000003e syscall=257 '
+              'success=yes auid=4294967295 uid=0 ses=4294967295 comm="sh" key="woam"\n')
+mQ = load(_q, RULES)
+agQ, sysQ = mQ.classify_dirty({k: dict(v) for k, v in _dirty_derived.items()})
+t("audit ON and no login-session command ran -> the ENGINE did it, no record demanded",
+  "app" in sysQ and agQ == {}, f"agent={list(agQ)} system={list(sysQ)}")
+
+_c = Path(_t2.mkdtemp()) / "cmd.log"
+_c.write_text(
+    'type=SYSCALL msg=audit(1785930300.1:77): arch=c000003e syscall=59 success=yes '
+    'auid=1000 uid=0 ses=99 comm="docker" exe="/usr/bin/docker" key="woam-cmd"\n'
+    'type=EXECVE msg=audit(1785930300.1:77): argc=3 a0="docker" a1="restart" a2="keycloak"\n')
+mC = load(_c, RULES)
+cmds = mC.audit_commands()
+t("a login-session command is parsed with its argv",
+  len(cmds) == 1 and cmds[0]["argv"] == ["docker", "restart", "keycloak"], str(cmds))
+agC, sysC = mC.classify_dirty({k: dict(v) for k, v in _dirty_derived.items()})
+t("so the SAME state change becomes the AGENT's to explain",
+  "app" in agC and sysC == {}, f"agent={list(agC)} system={list(sysC)}")
+t("and the report carries the command that caused it",
+  agC["app"].get("commands") == ["docker restart keycloak"], str(agC["app"].get("commands")))
+
+print("\n[6] three defects found by an adversarial read of this file")
 t("NEVER -w / (audit overhead is proportional to breadth)",
   not any(l.startswith("-w / ") or l.strip() == "-w / -p wa -k woam" for l in rules.splitlines()))
 t("all watches carry the woam key", all("-k woam" in l for l in rules.splitlines() if l.startswith("-w")))
