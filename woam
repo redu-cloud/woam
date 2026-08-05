@@ -304,6 +304,20 @@ def _qfield(rest: str, name: str):
     return m.group(1) if m else None
 
 
+def _qfields(rest: str, name: str):
+    """ALL values of a repeated quoted field.
+
+    A record can carry more than one key when a path is watched by more than one rule -
+    `key="identity"^"woam"` - which happens the moment woam runs on a host with a CIS or
+    STIG baseline, because those already watch /etc/passwd, /etc/sudoers and
+    /etc/ssh/sshd_config: exactly woam's `access` group. Taking only the FIRST match made
+    the parser order-dependent, so woam's own writes were dropped whenever somebody else's
+    rule sorted first. Membership, not equality.
+    """
+    m = re.search(r'\b%s=((?:"[^"]*"\^?)+)' % re.escape(name), rest)
+    return re.findall(r'"([^"]*)"', m.group(1)) if m else []
+
+
 def _nfield(rest: str, name: str):
     """A numeric audit field: auid=1000. Returns None if absent or not a number."""
     m = re.search(r"\b%s=(-?\d+)\b" % re.escape(name), rest)
@@ -319,23 +333,40 @@ def audit_available():
     return True, ""
 
 
-def audit_watched_paths():
-    """The paths woam has asked the kernel to watch, from OUR rules file.
-
-    This matters more than it looks. Absence of an audit event only means "the OS did it"
-    for a path that is actually WATCHED. For an unwatched path, absence means we do not
-    know - and reporting that as "the system did it" would be a fabrication of exactly the
-    kind this layer exists to end.
-    """
+def _paths_from(lines):
     out = []
-    try:
-        for line in AUDIT_RULES.read_text().splitlines():
-            m = re.match(r"\s*-w\s+(\S+)", line)
-            if m:
-                out.append(m.group(1).rstrip("/"))
-    except Exception:
-        pass
+    for line in lines:
+        m = re.match(r"\s*-w\s+(\S+)", line)
+        if m:
+            out.append(m.group(1).rstrip("/"))
     return out
+
+
+def audit_watched_paths():
+    """The paths the KERNEL is actually watching. Not the ones we asked for.
+
+    The distinction is not pedantic; it cost a wrong answer on a real VM. `auditctl`
+    REFUSES a watch on a path that does not exist yet, and on a compose deployment
+    /etc/redu-app is created by the app AFTER the installer runs. So 8 of 39 intended
+    watches never loaded. Reading the rules FILE, woam reported a path as watched, found
+    no audit record for a write that had definitely happened, and told the operator
+    "watched, and no write recorded" - which is the confidently-wrong answer this whole
+    layer exists to prevent, produced by the layer itself.
+
+    So: ask the kernel. Fall back to the file only when we cannot (non-root), and the
+    caller is told which, because "these are the watches we intended" and "these are the
+    watches in force" are different facts and only one of them licenses a conclusion.
+
+    Returns (paths, source) where source is "kernel" or "file".
+    """
+    r = subprocess.run(["auditctl", "-l"], capture_output=True, text=True, timeout=8) \
+        if sh("command -v auditctl") else None
+    if r is not None and r.returncode == 0 and "You must be root" not in (r.stderr or ""):
+        return _paths_from((r.stdout or "").splitlines()), "kernel"
+    try:
+        return _paths_from(AUDIT_RULES.read_text().splitlines()), "file"
+    except Exception:
+        return [], "file"
 
 
 def audit_writes(since_epoch: float = 0.0, key: str = AUDIT_KEY, limit: int = 4000):
@@ -360,21 +391,38 @@ def audit_writes(since_epoch: float = 0.0, key: str = AUDIT_KEY, limit: int = 40
                     continue
                 serial, typ, rest = m.group("serial"), m.group("t"), m.group("rest")
                 if typ == "SYSCALL":
-                    if _qfield(rest, "key") != key:
+                    if key not in _qfields(rest, "key"):
                         continue
                     auid = _nfield(rest, "auid")
                     if serial not in events:
                         order.append(serial)
+                    # THREE states, not two, and the difference is the whole gate.
+                    #
+                    # `_nfield` returns None for any value it cannot parse as a number -
+                    # including the literal `auid=unset` some builds emit. Folding None
+                    # into the "system" bucket meant an unparseable actor was reported as
+                    # "the OS did it", and classify_dirty routes system-only groups OUT of
+                    # the forced write. So a parse failure silently excused an agent from
+                    # recording its own change: the exact fabrication this layer exists to
+                    # prevent, produced by the layer itself.
+                    #
+                    # "I could not read who" is not "nobody". It gets its own state and it
+                    # keeps the gate closed.
+                    actor_kind = ("system" if auid is not None and (auid == AUID_UNSET or auid < 0)
+                                  else "login" if auid is not None
+                                  else "unknown")
                     events[serial] = {
                         "ts": ts, "serial": serial,
                         "auid": auid, "ses": _nfield(rest, "ses"),
                         "comm": _qfield(rest, "comm"), "exe": _qfield(rest, "exe"),
-                        "success": _qfield(rest, "success") or
-                                   (re.search(r"\bsuccess=(\w+)", rest).group(1)
+                        # The causing command, when audit recorded it. "Who" without
+                        # "what command" is much weaker at 2am.
+                        "proctitle": _qfield(rest, "proctitle"),
+                        "success": (re.search(r"\bsuccess=(\w+)", rest).group(1)
                                     if re.search(r"\bsuccess=(\w+)", rest) else None),
                         "paths": [],
-                        # The single load-bearing classification in this file.
-                        "system": auid is None or auid == AUID_UNSET or auid < 0,
+                        "actor_kind": actor_kind,
+                        "system": actor_kind == "system",
                     }
                 elif typ == "PATH" and serial in events:
                     # nametype=PARENT names the containing directory, not the thing that
@@ -403,7 +451,7 @@ def attribution_for(paths, since_epoch: float = 0.0):
     ok, _ = audit_available()
     if not ok:
         return "no-audit", [], []
-    watched = audit_watched_paths()
+    watched, _src = audit_watched_paths()
     if not watched:
         return "unwatched", [], []
 
@@ -419,11 +467,16 @@ def attribution_for(paths, since_epoch: float = 0.0):
             if any(p in wanted for p in e["paths"])]
     if not hits:
         return "none", [], []
-    human = [e for e in hits if not e["system"]]
-    if not human:
-        return "system", [], hits
-    actors = sorted({f"{uid_name(e['auid'])}(auid={e['auid']},ses={e['ses']})" for e in human})
-    return "agent", actors, human
+    human = [e for e in hits if e.get("actor_kind") == "login"]
+    if human:
+        actors = sorted({f"{uid_name(e['auid'])}(auid={e['auid']},ses={e['ses']})" for e in human})
+        return "agent", actors, human
+    # No login-session write. Before excusing the group as the OS's work, check we could
+    # actually READ every actor. One unparseable auid makes "the system did it" a guess,
+    # and a guess here silently lifts the forced write.
+    if any(e.get("actor_kind") == "unknown" for e in hits):
+        return "unattributable", [], hits
+    return "system", [], hits
 
 
 def audit_rules_text() -> str:
@@ -476,10 +529,39 @@ def append(rec: dict) -> None:
     claim = claimed_actor()
     if claim and "claims" not in rec:
         rec["claims"] = claim
-    line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
-    if len(line.encode()) > 3900:  # stay under PIPE_BUF so O_APPEND is atomic
-        rec["why"] = (rec.get("why") or "")[:600] + " ...(truncated)"
-        line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
+    # Keep the record small enough that a single append is atomic.
+    #
+    # The old guard shrank `why` once and never re-measured. Two problems, both measured:
+    # a `gap` record has `why: None` BY CONSTRUCTION, so on the largest records the guard
+    # could not fire at all; and `what`, `files`, `by` and `actors` are unbounded, so a
+    # record could sail past the limit through any of them. Shrink whatever is actually
+    # big, then check again, and truncate as a last resort so the line is never oversized.
+    #
+    # (Pedantry that matters if this ever runs on NFS: PIPE_BUF is a guarantee about
+    # PIPES. On Linux, append atomicity to a regular file comes from the inode lock held
+    # across the write. The same small-record discipline is what makes both safe, and
+    # neither holds over NFS.)
+    LIMIT = 3900
+
+    def render():
+        return json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
+
+    line = render()
+    if len(line.encode()) > LIMIT:
+        if rec.get("why"):
+            rec["why"] = rec["why"][:600] + " ...(truncated)"
+        for field, cap in (("what", 20), ("files", 20), ("subs", 20), ("actors", 8)):
+            v = rec.get(field)
+            if isinstance(v, list) and len(v) > cap:
+                rec[field] = v[:cap] + [f"...({len(v) - cap} more, truncated)"]
+        line = render()
+    if len(line.encode()) > LIMIT:
+        # Never emit an oversized line. A torn record costs the whole file's parseability.
+        rec = {"ts": rec.get("ts"), "v": VERSION, "ev": rec.get("ev"),
+               "group": rec.get("group"), "id": rec.get("id"),
+               "why": "record too large to store in full; detail dropped",
+               "truncated": True}
+        line = render()
     ROOT.mkdir(parents=True, exist_ok=True)
     # O_APPEND + a single write() is the atomic path. Never open("a") then print().
     fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -1258,8 +1340,28 @@ def cmd_audit_status(argv) -> int:
     ok, why = audit_available()
     print(f"audit log     {AUDIT_LOG}  {'readable' if ok else 'NO - ' + why}")
     print(f"rules file    {AUDIT_RULES}  {'present' if AUDIT_RULES.exists() else 'ABSENT'}")
-    watched = audit_watched_paths()
-    print(f"watched paths {len(watched)}")
+    watched, src = audit_watched_paths()
+    print(f"watched paths {len(watched)}  (source: {src})"
+          + ("" if src == "kernel" else
+             "  <- INTENDED, not confirmed loaded. Run as root to ask the kernel."))
+    # A rule file that lists a path auditctl refused (it did not exist yet) reads as
+    # coverage we do not have. Measured on a real compose VM: 8 of 39 watches never
+    # loaded because the app created /etc/redu-app after the installer ran.
+    if src == "kernel":
+        try:
+            intended = _paths_from(AUDIT_RULES.read_text().splitlines())
+            missing = [p for p in intended if p not in watched]
+            if missing:
+                print(f"NOT LOADED   {len(missing)} intended watch(es) are not in force, "
+                      f"e.g. {missing[0]}")
+                print("             (auditctl refuses a watch on a path that does not exist yet)")
+        except Exception:
+            pass
+    # A single rule can silently disable every watch on the box.
+    if "never,task" in sh("auditctl -l 2>/dev/null"):
+        print("⚠ `-a never,task` IS LOADED. It short-circuits audit at fork, so watches")
+        print("  match NOTHING. woam would report 'no writes recorded' on a machine where")
+        print("  nothing is being recorded. Ships by default on RHEL-family images.")
     auid, ses = self_login()
     if auid is None:
         print("this process  loginuid UNAVAILABLE (kernel without audit support?)")

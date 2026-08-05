@@ -150,7 +150,68 @@ t("every watch is an absolute path", all(w.startswith("/") for w in watched))
 t("no watch is a bare top-level directory", all(w.count("/") >= 2 for w in watched),
   str([w for w in watched if w.count("/") < 2]))
 
-print("\n[6] this process's own login identity, free from the kernel")
+print("\n[6] three defects found by an adversarial read of this file")
+
+# (a) THE SERIOUS ONE. `_nfield` returns None for any value it cannot parse as a number,
+# including the literal `auid=unset` some builds emit. Folding None into "system" meant an
+# unreadable actor was reported as the OS's work - and classify_dirty routes system-only
+# groups OUT of the forced write. A parse failure silently excused an agent from recording
+# its own change.
+import tempfile as _tf
+_p = Path(_tf.mkdtemp()) / "unset.log"
+_p.write_text(
+    'type=SYSCALL msg=audit(1785930231.9:9001): arch=c000003e syscall=257 success=yes '
+    'auid=unset uid=0 ses=unset comm="sh" exe="/usr/bin/dash" key="woam"\n'
+    'type=PATH msg=audit(1785930231.9:9001): item=1 name="/etc/redu-app/.attrib" '
+    'nametype=NORMAL\n')
+mU = load(_p, RULES)
+evU = mU.audit_writes()
+t("an UNPARSEABLE auid is parsed as its own state, not as the OS",
+  len(evU) == 1 and evU[0]["actor_kind"] == "unknown", str([e.get("actor_kind") for e in evU]))
+t("and is NOT classified as system", len(evU) == 1 and evU[0]["system"] is False)
+vU, _a, _h = mU.attribution_for([TARGET])
+t("the verdict is 'unattributable', never 'system'", vU == "unattributable", f"got {vU!r}")
+agU, sysU = mU.classify_dirty({"app": {"since": "1970-01-01T00:00:00Z", "subs": [("env", 1)],
+    "files": 1, "named": {"env": {"modified": [TARGET], "created": [], "removed": []}}}})
+t("so it stays INSIDE the gate and is not silently excused",
+  "app" in agU and sysU == {}, f"agent={list(agU)} system={list(sysU)}")
+
+# (b) A record can carry several keys when more than one rule watches a path - which is
+# what happens the moment woam runs on a CIS/STIG-hardened host, because those baselines
+# already watch /etc/passwd, /etc/sudoers and /etc/ssh/sshd_config: woam's `access` group.
+_p2 = Path(_tf.mkdtemp()) / "multikey.log"
+_p2.write_text(
+    'type=SYSCALL msg=audit(1785930231.9:9002): arch=c000003e syscall=257 success=yes '
+    'auid=1000 uid=0 ses=42 comm="sed" exe="/usr/bin/sed" key="identity"^"woam"\n'
+    'type=PATH msg=audit(1785930231.9:9002): item=1 name="/etc/redu-app/.attrib" '
+    'nametype=NORMAL\n')
+mM = load(_p2, RULES)
+t("a record whose FIRST key belongs to somebody else is still ours",
+  len(mM.audit_writes()) == 1, f"got {len(mM.audit_writes())}")
+t("and the write is attributed normally", mM.attribution_for([TARGET])[0] == "agent")
+
+# (c) The size guard shrank `why` and never re-measured. A `gap` record has why=None BY
+# CONSTRUCTION, so on the very records most likely to be large the guard could not fire.
+_big = {"ev": "gap", "group": "app", "id": "abc123", "why": None,
+        "what": [f"mod:env:/etc/redu-app/{'x' * 90}-{i}" for i in range(200)],
+        "files": 200, "by": "ubuntu(auid=1000,ses=1)"}
+import json as _json
+_rendered = {}
+_orig_open, _orig_write = os.open, os.write
+os.open = lambda *a, **k: 0                                    # capture instead of write
+os.write = lambda fd, b: _rendered.setdefault("line", b) and None
+os.close = lambda fd: None
+try:
+    m.ROOT = Path(_tf.mkdtemp()); m.LOG = m.ROOT / "changes.jsonl"
+    m.append(dict(_big))
+finally:
+    os.open, os.write = _orig_open, _orig_write
+_line = _rendered.get("line", b"")
+t("a gap record with why=None is still forced under the atomicity limit",
+  0 < len(_line) < 4096, f"{len(_line)} bytes")
+t("and it is still one valid JSON line", (lambda: (_json.loads(_line.decode().rstrip('\n')), True)[1])())
+
+print("\n[7] this process's own login identity, free from the kernel")
 auid, ses = m.self_login()
 t("loginuid is readable without auditd installed", auid is not None, str(auid))
 t("sessionid too", ses is not None, str(ses))
