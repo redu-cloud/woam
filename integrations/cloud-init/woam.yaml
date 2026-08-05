@@ -1,24 +1,31 @@
 #cloud-config
 # Install woam at provision time and take the first baseline.
 #
-# Keep this SMALL. It gets merged into a larger user_data document, and the
-# cloud provider caps user_data at 65,535 base64 characters. A deploy template
-# that is already near the cap and silently goes over it fails at server-create,
-# before a VM exists, which does not look like a cloud-init problem at all.
+# This is what redu emits onto every VM it provisions, reduced to the one line that matters.
+# Three properties are not optional, and each one is a failure somebody has already had:
 #
-# runcmd is correct here even though runcmd does not survive a reboot: installing
-# a binary is a one-time act. Anything that must be true on EVERY boot belongs in
-# a systemd unit instead.
-
-write_files:
-  # The pointer. It carries no state, only the invariant, so it can never go
-  # stale and can be copied anywhere.
-  - path: /etc/profile.d/woam.sh
-    permissions: '0755'
-    content: |
-      # Printed on every login. Only invariants: no ports, no IPs, no status,
-      # because nothing regenerates this file.
-      command -v woam >/dev/null 2>&1 && woam status 2>/dev/null | head -3
+#  1. IT IS THE LAST runcmd ENTRY. The installer takes woam's first baseline, and a baseline
+#     taken before the machine is provisioned makes the whole provisioning read as unrecorded
+#     changes: the first `woam` anyone runs exits non-zero on a machine nobody touched. That
+#     teaches every agent to ignore it on day one.
+#
+#  2. IT CAN NEVER FAIL THE BOOT. `|| true` swallows every failure and `--max-time` bounds the
+#     hang. Verified against an unreachable host, a 404, a dead network and a garbage body: all
+#     four exit 0. A memory tool that costs somebody their VM is a bad trade at any value.
+#
+#  3. STDERR IS NOT REDIRECTED. stdout is chatty and goes to its own log; failures belong in
+#     /var/log/cloud-init-output.log, where anyone debugging the machine actually looks. `2>&1`
+#     would file every error somewhere nobody knows to open, which is the same
+#     "clean means I could not look" failure woam exists to prevent.
+#
+# Keep it SMALL. It merges into a larger user_data document and cloud providers cap user_data
+# (65,535 base64 characters on OpenStack Nova). This is why the tool is FETCHED and not embedded:
+# ~36 KB inline blows a document already near the cap, and it fails at server-create, before a VM
+# exists, looking nothing like a cloud-init problem.
+#
+# runcmd is right even though runcmd does not survive a reboot: installing a binary is a one-time
+# act. Anything that must be true on EVERY boot belongs in a systemd unit.
 
 runcmd:
-  - [ sh, -c, 'curl -fsSL https://redu.cloud/woam-install.sh | sh' ]
+  # ... your own setup commands come first ...
+  - [ sh, -c, 'curl -fsSL --max-time 60 https://redu.cloud/woam-install.sh | sh >/var/log/woam-install.log || true' ]
