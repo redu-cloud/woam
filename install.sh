@@ -181,6 +181,37 @@ PROF
   chmod 0644 /etc/profile.d/woam.sh
 fi
 
+# --- and again, where AGENTS will actually see it --------------------------------
+# ⚠️ /etc/profile.d above is NOT enough, and believing it was cost a real incident.
+#    It is sourced by LOGIN shells. Every agent drives a machine with
+#    `ssh host "command"`, which is neither a login shell nor interactive, so the
+#    notice never printed. Measured 2026-08-05: two agents worked one VM for hours
+#    with the banner installed the whole time; neither ever saw it, and one published
+#    a wrong cause for an outage that woam had already recorded correctly.
+#
+#    Bash DOES read ~/.bashrc for `ssh host "cmd"` (it detects stdin on a socket) -
+#    verified on a live VM. But Ubuntu's stock ~/.bashrc returns on line ~5 for
+#    non-interactive shells, so the line has to go ABOVE that guard.
+#
+#    `banner --notice` writes to STDERR and prints NOTHING unless there is an
+#    unexplained change, so `ssh host "cat file"` still returns exactly the file.
+if [ "$(id -u)" = "0" ]; then
+  for _rc in /root/.bashrc /home/*/.bashrc; do
+    [ -f "$_rc" ] || continue
+    grep -q 'woam banner --notice' "$_rc" 2>/dev/null && continue
+    _tmp="$(mktemp)" || continue
+    {
+      echo '# woam: non-interactive notice. MUST stay above the non-interactive guard'
+      echo '# below, or `ssh host "cmd"` never sees it. stderr + silent-when-clean.'
+      # No redirect: `banner --notice` already writes to stderr and nothing to stdout.
+      # `2>&1 >/dev/null` would move it ONTO the stdout channel, which is the one thing
+      # this must never touch.
+      echo 'command -v woam >/dev/null 2>&1 && woam banner --notice || true'
+      cat "$_rc"
+    } >"$_tmp" && cat "$_tmp" >"$_rc" && rm -f "$_tmp"
+  done
+fi
+
 # --- first baseline, LAST ------------------------------------------------------
 # The order matters and getting it wrong is not cosmetic. Measured on a real first
 # boot: with the baseline taken BEFORE the auditd install, installing auditd itself

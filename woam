@@ -1730,7 +1730,30 @@ def cmd_banner(argv) -> int:
     container layer and costs over a second, which on every shell would get this deleted
     within a week. This reads one file and counts.
     """
-    print(BANNER)
+    # --notice: the same information, aimed at the ONE access pattern agents actually use.
+    #
+    # ⚠️ MEASURED 2026-08-05, and it is why this mode exists. Two independent agents worked
+    #    the same VM for hours. One deliberately broke a DATABASE_URL; the other found and
+    #    fixed it. The first then WROTE DOWN, as its headline finding, that "redu's control
+    #    plane auto-reconciled the env file" - a platform capability that does not exist.
+    #    woam had the answer the whole time (two sed calls, two different login sessions,
+    #    both auid=1000, 6 minutes apart) and neither agent ever ran it.
+    #
+    #    The banner was already installed on that machine, at /etc/profile.d/woam.sh. It
+    #    never printed, because /etc/profile.d is sourced by LOGIN shells and every agent
+    #    uses `ssh host "command"`, which is neither login nor interactive. The record was
+    #    written, the notice was installed, and the two never met.
+    #
+    # Two rules make this survivable on every single command:
+    #   - STDERR, never stdout. An agent running `ssh host "cat some.conf"` must get the
+    #     file and nothing else, or this corrupts real automation and gets deleted.
+    #   - SILENT when there is nothing unexplained. A notice that fires every time is noise
+    #     and trains agents to ignore it, which is worse than not having it (the same
+    #     "a false positive is worse than a miss" rule that governs the preflight rules).
+    notice = "--notice" in argv
+    out = sys.stderr if notice else sys.stdout
+    if not notice:
+        print(BANNER)
     try:
         entries = read_log()
     except Exception:
@@ -1743,10 +1766,16 @@ def cmd_banner(argv) -> int:
         # ended the incident above in one read instead of a log-reading expedition.
         last = gaps[-1]
         what = (last.get("what") or ["?"])[0]
-        print(f"  {len(gaps)} UNEXPLAINED change(s) on this machine. Most recent:")
-        print(f"    {last.get('ts')}  {last.get('group')}  {what}")
-        print(f"    woam gaps   to see them all")
-    elif notes:
+        if notice:
+            print(f"[woam] {len(gaps)} UNEXPLAINED change(s) on this machine. "
+                  f"Latest: {last.get('ts')} {last.get('group')} {what}", file=out)
+            print("[woam] Who changed a file: `woam who <path>`. All of them: `woam gaps`. "
+                  "Do not infer a cause you can look up.", file=out)
+        else:
+            print(f"  {len(gaps)} UNEXPLAINED change(s) on this machine. Most recent:")
+            print(f"    {last.get('ts')}  {last.get('group')}  {what}")
+            print(f"    woam gaps   to see them all")
+    elif notes and not notice:
         print(f"  {len(notes)} recorded change(s). `woam show <group>` before you debug.")
     return 0
 

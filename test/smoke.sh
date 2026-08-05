@@ -305,5 +305,37 @@ done)
 t "no em-dashes in tracked files" "$([ -z "$DASHES" ] && echo 0 || echo 1)" "$DASHES"
 
 echo
+echo "[16] the notice reaches a NON-INTERACTIVE ssh, and never corrupts stdout"
+# The whole point. Measured 2026-08-05: the login banner was installed on a VM the
+# entire time two agents worked it, and neither ever saw it, because /etc/profile.d is
+# sourced by LOGIN shells and every agent drives a machine with `ssh host "command"`.
+# One of them then published a wrong cause for an outage woam had recorded correctly.
+NDIR="$(mktemp -d)"
+
+# a) silent when there is nothing unexplained - a notice that always fires is noise,
+#    and noise gets ignored, which is worse than not having it at all.
+: > "$NDIR/changes.jsonl"
+QUIET="$(WOAM_ROOT="$NDIR" python3 "$HERE/../woam" banner --notice 2>&1)"
+t "notice is silent on a machine with nothing unexplained" "$([ -z "$QUIET" ] && echo 0 || echo 1)" "$QUIET"
+
+# b) speaks when there IS something unexplained
+printf '%s\n' '{"ts":"2026-01-01T00:00:00Z","v":1,"ev":"gap","id":"aaa111","group":"app","by":"ubuntu(auid=1000,ses=9)","by_evidence":"agent","what":["mod:env:/etc/redu-app/redu-app.env"],"files":1,"why":null,"closed":false}' > "$NDIR/changes.jsonl"
+LOUD="$(WOAM_ROOT="$NDIR" python3 "$HERE/../woam" banner --notice 2>&1)"
+case "$LOUD" in *UNEXPLAINED*) r=0;; *) r=1;; esac
+t "notice names the unexplained change" "$r" "$LOUD"
+case "$LOUD" in *"woam who"*) r=0;; *) r=1;; esac
+t "notice tells the agent HOW to ask who changed it" "$r" "$LOUD"
+
+# c) STDOUT MUST STAY EMPTY. An agent running `ssh host "cat file"` has to get the file
+#    and nothing else; polluting stdout breaks real automation and gets this deleted.
+SOUT="$(WOAM_ROOT="$NDIR" python3 "$HERE/../woam" banner --notice 2>/dev/null)"
+t "notice writes NOTHING to stdout" "$([ -z "$SOUT" ] && echo 0 || echo 1)" "$SOUT"
+
+# d) the installer must place it ABOVE Ubuntu's non-interactive guard, or it is dead code
+grep -q 'woam banner --notice' "$HERE/../install.sh"
+t "installer wires the notice into ~/.bashrc" "$?" ""
+rm -rf "$NDIR"
+
+echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
