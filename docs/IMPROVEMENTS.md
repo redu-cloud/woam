@@ -167,6 +167,40 @@ Log entries after a system is subverted cannot be trusted, and every technique t
 
 ---
 
+## EXPERIMENT (parked, not rejected): woam inside the containers too
+
+The idea: `docker exec` is shaped like ssh, and a Linux container is shaped like a small VM
+with its own `/etc`, its own app tree, its own package state. So run woam in there as well,
+have the container record its own mutations, and have the host aggregate.
+
+**I first argued against this partly on the grounds that it would mean modifying the
+customer's images. That is a constraint from the deploy code, not from the business.** The
+stated position is that changing a client's containers to get them better results is in
+scope. So that objection is void and the idea is parked for experimentation, not dismissed.
+
+What actually survives, separated into what is solvable and what is not:
+
+| Objection | Status |
+|---|---|
+| No `python3` in keycloak, postgres or the Next.js image (measured: 0 of 3) | **Solvable.** Inject a static single-file binary, or write a POSIX-sh variant for the in-container case |
+| Writable layer is wiped on recreate, so the record dies | **Solvable.** Bind-mount the log out to the host, which also puts every container's record in one place |
+| **`/proc/self/loginuid` inside a container reads `4294967295`** | **NOT solvable from inside.** Measured on the live VM. There is no login identity in a container, because containers never pass through PAM, and `auditd` is one subsystem per KERNEL and not per namespace. An in-container woam can see WHAT changed and can never see WHO |
+
+So the shape of the experiment is a **hybrid, and it was always going to be**: attribution
+can only come from the host, because that is the only place the identity exists. What an
+in-container agent would buy is better CONTENT detection than `docker diff` gives - real
+group partitioning, config-key diffing, per-file metadata - inside a container big enough
+for that to matter.
+
+Worth trying when: a customer runs a container complex enough that `docker diff`'s
+writable-layer list is too coarse, or when we want the same functional groups (`app`,
+`service`, `network`) *inside* a container rather than a flat path list.
+
+Not worth trying before: the host-side version has been used in anger and we know which
+parts of the record agents actually read.
+
+---
+
 ## Corrections to things we believed
 
 - **Wazuh did NOT move whodata off auditd.** As of 4.12 auditd is still the default provider; eBPF is opt-in with fallback eBPF -> audit -> inotify. The eBPF issue names no auditd defect and contains no performance data.
