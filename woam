@@ -1042,8 +1042,21 @@ def dirty_groups(against=None) -> dict:
 
 
 def rebaseline(names=None) -> None:
+    """names=None means EVERY group. names=[] means NONE of them.
+
+    `names or list(GROUPS)` collapsed those two, because an empty list is falsy - so
+    "rebaseline nothing" silently meant "rebaseline everything". That is not a style
+    point: `seal --grace` HOLDS a change that is still inside the window and passes the
+    remaining groups here, which is usually the empty list. The held change was then
+    absorbed into a fresh baseline and lost forever.
+
+    Caught on a live VM: the timer fired one second after a container restart, printed
+    "holding app (last write 1s ago)", and rebaselined the whole machine anyway. The
+    grace window was not delaying the record, it was destroying it - the exact failure
+    the comment three functions up says it exists to prevent.
+    """
     base = load_baseline()
-    for name in (names or list(GROUPS)):
+    for name in (list(GROUPS) if names is None else names):
         try:
             r = hash_group(name)
         except Exception:
@@ -1656,8 +1669,38 @@ def cmd_audit_install(argv) -> int:
         return 1
     # Load now as well as at boot. A rule that only applies after the next reboot is a
     # blind window nobody remembers to close.
-    loaded, failed = 0, 0
+    # Idempotent, because this now runs on a timer as well as at install.
+    #
+    # auditctl refuses a watch on a path that does not exist YET, and on a compose deploy
+    # the app creates /etc/redu-app after provisioning - measured: 8 of 39 watches never
+    # loaded and nothing ever retried, so file attribution on the app's own config was
+    # silently off for the life of the machine. Re-running picks them up as they appear.
+    #
+    # Skip what the kernel already holds: adding a duplicate watch errors, and counting
+    # that as a failure would make a healthy machine look broken every 10 minutes.
+    already, _src = audit_watched_paths()
+    # Exec rules too. The kernel normalises them on the way out (`auid!=unset` comes back
+    # as `auid!=-1`), so an exact string compare never matches and every run re-added all
+    # of them, got them rejected as duplicates, and printed "8 failed - that is a gap, not
+    # a warning" into the journal every 10 minutes. A monitor that cries wolf on a healthy
+    # machine gets muted, and then it is not a monitor. Compare on the path instead.
+    exec_already = set()
+    for l in sh("auditctl -l 2>/dev/null").splitlines():
+        if AUDIT_CMD_KEY in l:
+            m = re.search(r"-F path=(\S+)", l)
+            if m:
+                exec_already.add(m.group(1))
+
+    loaded, failed, skipped = 0, 0, 0
     for line in audit_rules_text().splitlines():
+        if line.startswith("-w ") and line.split()[1].rstrip("/") in already:
+            skipped += 1
+            continue
+        if line.startswith("-a "):
+            m = re.search(r"-F path=(\S+)", line)
+            if m and m.group(1) in exec_already:
+                skipped += 1
+                continue
         # BOTH kinds. The loader used to take only `-w` lines, so the exec rules were
         # written to the file and never put in force - and woam then saw no command behind
         # a container restart and concluded the ENGINE had done it. A rule that exists on
@@ -1671,7 +1714,8 @@ def cmd_audit_install(argv) -> int:
         r = subprocess.run(["auditctl"] + line.split(), capture_output=True, text=True)
         loaded += 1 if r.returncode == 0 else 0
         failed += 0 if r.returncode == 0 else 1
-    print(f"{AUDIT_RULES} written; {loaded} watch(es) loaded"
+    print(f"{AUDIT_RULES} written; {loaded} rule(s) loaded"
+          + (f", {skipped} already in force" if skipped else "")
           + (f", {failed} failed" if failed else ""))
     if failed:
         print("a failed watch means those paths have NO attribution. That is a gap, not a warning.")

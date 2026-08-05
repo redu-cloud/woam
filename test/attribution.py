@@ -180,7 +180,6 @@ t("so the SAME state change becomes the AGENT's to explain",
 t("and the report carries the command that caused it",
   agC["app"].get("commands") == ["docker restart keycloak"], str(agC["app"].get("commands")))
 
-print("\n[6] three defects found by an adversarial read of this file")
 t("NEVER -w / (audit overhead is proportional to breadth)",
   not any(l.startswith("-w / ") or l.strip() == "-w / -p wa -k woam" for l in rules.splitlines()))
 t("all watches carry the woam key", all("-k woam" in l for l in rules.splitlines() if l.startswith("-w")))
@@ -204,6 +203,25 @@ t("but the app's compose FILES are still watched (config, not runtime)",
 t("every watch is an absolute path", all(w.startswith("/") for w in watched))
 t("no watch is a bare top-level directory", all(w.count("/") >= 2 for w in watched),
   str([w for w in watched if w.count("/") < 2]))
+
+print("\n[5c] a HELD change must survive, not be absorbed by a fresh baseline")
+# `seal --grace` holds a change still inside the window and rebaselines only what it
+# accounted for - usually the empty list. `names or list(GROUPS)` treated that empty list
+# as "everything", so the held change was absorbed and lost. Measured on a live VM: the
+# timer fired 1s after a container restart, printed "holding app (last write 1s ago)", and
+# rebaselined the whole machine anyway. The grace window was destroying records, not
+# delaying them.
+_seen = {"all": 0, "named": []}
+_mR = load(FIX / "audit-real.log", RULES)
+_mR.hash_group = lambda n: {"hash": "x", "subs": {}}
+_mR.save_baseline = lambda b: _seen.__setitem__("saved", dict(b))
+_mR.load_baseline = lambda: {}
+_mR.rebaseline([])
+t("rebaseline([]) touches NO group, not every group",
+  _seen.get("saved") == {}, str(_seen.get("saved"))[:80])
+_mR.rebaseline(None)
+t("rebaseline(None) still means every group",
+  set(_seen.get("saved", {})) == set(_mR.GROUPS), str(list(_seen.get("saved", {})))[:80])
 
 print("\n[6] three defects found by an adversarial read of this file")
 

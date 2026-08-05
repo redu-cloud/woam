@@ -131,6 +131,10 @@ Wants=auditd.service
 
 [Service]
 Type=oneshot
+# Refresh the watches first. auditctl refuses a watch on a path that does not
+# exist yet, so a path the app creates after provisioning is never watched unless
+# something retries. Idempotent: rules already in force are skipped.
+ExecStartPre=-/usr/local/bin/woam audit-install
 ExecStart=/usr/local/bin/woam seal --grace 600
 Nice=10
 IOSchedulingClass=idle
