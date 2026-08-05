@@ -793,8 +793,11 @@ def classify_dirty(dirty: dict):
         for _sname, dd in (d.get("named") or {}).items():
             for kind in ("modified", "created", "removed"):
                 paths.extend(dd.get(kind) or [])
-        verdict, actors, _ev = attribution_for(paths, epoch_of(d.get("since", "")))
+        verdict, actors, ev = attribution_for(paths, epoch_of(d.get("since", "")))
         d["verdict"], d["actors"] = verdict, actors
+        # When the last write landed, from the audit record rather than from a guess.
+        # `woam seal --grace` uses it to leave work that is still in progress alone.
+        d["last_write"] = max((e["ts"] for e in ev), default=None)
         (system if verdict == "system" else agent)[name] = d
     return agent, system
 
@@ -947,7 +950,26 @@ def cmd_note(argv) -> int:
             "deferred": deferred, "subs": [sn for sn, _ in d.get("subs", [])],
             "what": what[:20], "files": d.get("files")})
     rebaseline([group])
+
+    # Explaining a group closes any gap still open on it.
+    #
+    # Sealing is automatic now, so the two can cross: the timer records "changed, WHY NOT
+    # RECORDED" and the agent explains itself a minute later. Without this, the log keeps
+    # a permanent "nobody said why" next to a note that says exactly why, and every future
+    # reader is told the machine is less understood than it is. The gap keeps its own
+    # timestamp, so the record still shows the explanation arrived after the fact.
+    closed = 0
+    if not deferred:
+        already = {e.get("id") for e in read_log() if e.get("ev") == "gap_closed"}
+        for e in read_log():
+            if e.get("ev") == "gap" and e.get("group") == group and e.get("id") not in already:
+                append({"ev": "gap_closed", "id": e["id"], "group": group, "why": why,
+                        "by": actor(), "happened_at": e.get("ts"), "via": "note"})
+                closed += 1
+
     print(f"recorded against {group}" + ("  (deferred: no cause given)" if deferred else ""))
+    if closed:
+        print(f"  and closed {closed} open gap(s) on {group} that a seal had left unexplained")
     return 0
 
 
@@ -998,6 +1020,22 @@ def cmd_seal(argv) -> int:
     next agent learns the state changed AND that the reasoning is unknown, so it
     verifies instead of trusting.
     """
+    # Validate arguments BEFORE any work. Parsing --grace further down meant a typo was
+    # accepted silently whenever nothing happened to be dirty, so `--grace onehour` in a
+    # systemd unit would look fine on a quiet machine and seal with no grace at all on a
+    # busy one. An argument error must not depend on the state of the box.
+    grace, held = 0, {}
+    if "--grace" in argv:
+        i = argv.index("--grace")
+        try:
+            grace = int(argv[i + 1])
+        except (IndexError, ValueError):
+            print("usage: woam seal --grace <seconds>", file=sys.stderr)
+            return 2
+        if grace < 0:
+            print("woam seal: --grace cannot be negative", file=sys.stderr)
+            return 2
+
     sid = None
     if "--session" in argv:
         i = argv.index("--session")
@@ -1023,10 +1061,39 @@ def cmd_seal(argv) -> int:
     if system_dirty:
         print(f"  skipped {len(system_dirty)} group(s) the SYSTEM changed: "
               + ", ".join(system_dirty) + " (no login session behind them)")
+
+    # --grace: leave work that is still in progress alone.
+    #
+    # This exists because sealing is now AUTOMATIC (a systemd timer), and an automatic
+    # seal races the agent it is meant to help. Without it: agent edits a file, the timer
+    # fires 30s later and records "changed, WHY NOT RECORDED", the agent then runs
+    # `woam note` and finds nothing dirty because seal already rebaselined. The result is
+    # a permanent unexplained gap for a change somebody DID explain, and a note with no
+    # content attached. The tool would be manufacturing the exact ignorance it exists to
+    # prevent.
+    #
+    # The timestamp comes from the audit record, so this is the real time of the last
+    # write, not a guess. With attribution off there is no timestamp, and skipping would
+    # mean never sealing at all, so those groups are sealed as before.
+    if grace > 0:
+        for name in list(agent_dirty):
+            lw = agent_dirty[name].get("last_write")
+            if lw is not None and (time.time() - lw) < grace:
+                held[name] = int(time.time() - lw)
+                del agent_dirty[name]
+        if held:
+            print("  holding " + ", ".join(f"{n} (last write {s}s ago)" for n, s in held.items())
+                  + f"; still inside the {grace}s grace window")
+    # Rebaseline ONLY what has been accounted for. A held group must keep its old
+    # baseline or the change it is holding is forgotten entirely: the next run would
+    # compare against a snapshot that already contains the edit and report nothing. The
+    # grace window would then not be delaying the record, it would be destroying it.
+    accounted = list(system_dirty) + list(agent_dirty)
+
     if not agent_dirty:
         print("nothing unrecorded that a login session is responsible for")
-        rebaseline(list(dirty))
-        if sid:
+        rebaseline(accounted)
+        if sid and not held:
             try: session_file(sid).unlink()
             except Exception: pass
         return 0
@@ -1055,8 +1122,8 @@ def cmd_seal(argv) -> int:
         for w in what[:4]:
             print(f"          {w}")
         sealed += 1
-    rebaseline(list(dirty))
-    if sid:
+    rebaseline(accounted)
+    if sid and not held:
         try: session_file(sid).unlink()
         except Exception: pass
     print(f"\nsealed {sealed} group(s) with the reason marked MISSING.")

@@ -105,6 +105,61 @@ elif [ "${WOAM_AUDIT:-1}" = "1" ]; then
   say "woam: not root, skipping attribution setup.  sudo woam audit-install  turns it on."
 fi
 
+# --- make the last write involuntary --------------------------------------------
+# `woam seal` is the record that matters most and the one nobody makes: it happens
+# when the work is finished, the agent has no remaining stake, and the session may
+# already be ending. Depending on an agent to run it is the same voluntary problem
+# one level up from `woam note`.
+#
+# A systemd timer, NOT a PAM hook. The PAM route fires exactly at session end, which
+# mattered when session boundaries were how we inferred who did what. Attribution now
+# comes from the kernel, so the trigger only has to be automatic, not precise. And
+# editing /etc/pam.d/sshd can lock a machine out permanently, with no way back in over
+# the network. That is not a risk worth taking on a customer's VM for a timing
+# refinement we no longer need.
+#
+# The timer is also strictly better here: it catches long-lived sessions that never
+# end, and changes made through the API rather than over ssh. The PAM hooks are still
+# in integrations/pam/ for anyone who wants exact session-end sealing and accepts the
+# lockout risk deliberately.
+if [ "${WOAM_TIMER:-1}" = "1" ] && [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+  cat >/etc/systemd/system/woam-seal.service <<'UNIT'
+[Unit]
+Description=woam: record what changed on this machine, and who changed it
+After=auditd.service
+Wants=auditd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/woam seal --grace 600
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=120
+User=root
+UNIT
+  cat >/etc/systemd/system/woam-seal.timer <<'UNIT'
+[Unit]
+Description=woam: seal unexplained changes periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl enable --now woam-seal.timer >/dev/null 2>&1; then
+    say "woam: sealing is automatic (systemd timer, every 10min, 10min grace)"
+  else
+    # Say it. A silent failure here means the last write quietly goes back to being
+    # voluntary, which is the failure this whole mechanism exists to remove.
+    say "woam: could not enable the seal timer; sealing is MANUAL on this machine"
+  fi
+fi
+
 # --- first baseline, LAST ------------------------------------------------------
 # The order matters and getting it wrong is not cosmetic. Measured on a real first
 # boot: with the baseline taken BEFORE the auditd install, installing auditd itself

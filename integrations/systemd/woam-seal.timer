@@ -1,0 +1,17 @@
+[Unit]
+Description=woam: seal unexplained changes periodically
+Documentation=https://redu.cloud/woam
+
+[Timer]
+# The LAST write is the one nobody does. This is what makes it happen without
+# anybody choosing to, which is the entire point: the agent that would benefit from
+# the record is not the agent that has to write it.
+OnBootSec=10min
+OnUnitActiveSec=10min
+# Spread the load when a fleet boots together.
+RandomizedDelaySec=120
+# A machine that was off still gets its seal on the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

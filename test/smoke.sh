@@ -208,6 +208,41 @@ t "audit-rules still prints the watches with no auditd installed" "$(has '-k woa
 t "and never watches the whole filesystem" "$(hasnt '-w / -p')"
 
 echo
+echo "[13b] automatic sealing must not race the agent it is helping"
+# Sealing is a systemd timer now, so seal and note can cross: the timer records
+# "changed, WHY NOT RECORDED" while the agent is still working, rebaselines, and the
+# agent's own `woam note` then finds nothing to attach to. The result is a permanent
+# unexplained gap for a change somebody DID explain. Two mechanisms stop that, and
+# both are asserted here.
+python3 - "$WOAM_ROOT/baseline.json" <<'PY'
+import json, sys
+p = sys.argv[1]; b = json.load(open(p))
+for g, gi in b.items():
+    for sname, r in (gi.get("subs") or {}).items():
+        if r.get("f"):
+            r["f"].pop(sorted(r["f"])[0]); r["hash"] = "2" * 16; gi["hash"] = "2" * 16
+            json.dump(b, open(p, "w")); print(g); raise SystemExit(0)
+PY
+DIRTY2=$(python3 -c "import json,sys;b=json.load(open(sys.argv[1]));print([g for g,v in b.items() if v.get('hash')=='2'*16][0])" "$WOAM_ROOT/baseline.json")
+rc=$(run seal --grace 99999)
+t "seal --grace exits 0" "$([ "$rc" = 0 ] && echo 0 || echo 1)" "$(out)"
+# With attribution off there is no write timestamp, so nothing can be held and the
+# group is sealed as before. Skipping instead would mean never sealing at all.
+t "with attribution OFF, grace cannot hold and the change is still recorded" "$(has 'WHY NOT RECORDED')"
+rc=$(run seal --grace notanumber)
+t "a bad --grace value is rejected, not silently treated as 0" "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got exit $rc"
+
+# The crossover: a gap exists, then the agent explains the group.
+GAPID2=$(run gaps >/dev/null; grep -oE '\b[0-9a-f]{6}\b' "$WOAM_ROOT/.out" | head -1)
+run note "$DIRTY2" "explained after the timer already sealed it" >/dev/null
+t "explaining a group closes the gap a seal left open" "$(has 'closed 1 open gap')"
+run gaps >/dev/null
+t "and the gap no longer shows as unexplained" "$(hasnt "$GAPID2")"
+run log >/dev/null
+t "history is not rewritten: a gap_closed record is appended" "$(has 'gap_closed')"
+t "and it records that the explanation came via a note" "$(has '"via":"note"')"
+
+echo
 echo "[14] the installer's ORDER, which a real first boot proved is not cosmetic"
 # Measured on a fresh VM: with the baseline taken BEFORE the auditd install,
 # installing auditd itself showed up as an unrecorded change and the first `woam` an

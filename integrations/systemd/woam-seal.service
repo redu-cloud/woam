@@ -1,0 +1,21 @@
+[Unit]
+Description=woam: record what changed on this machine, and who changed it
+Documentation=https://redu.cloud/woam
+# Attribution comes from the audit log, so there is no point running before auditd.
+After=auditd.service
+Wants=auditd.service
+
+[Service]
+Type=oneshot
+# --grace 600: leave anything written in the last 10 minutes alone. An automatic
+# seal races the agent it is meant to help - it would record "changed, WHY NOT
+# RECORDED" while the agent is still working, rebaseline, and leave the agent's own
+# `woam note` with nothing to attach to. The window comes from the audit record, so
+# it is the real time of the last write.
+ExecStart=/usr/local/bin/woam seal --grace 600
+# It must never be able to take a machine down. Nothing here is worth an alert.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=120
+# Root only because the audit log is root-readable. No network, no privileges beyond it.
+User=root
