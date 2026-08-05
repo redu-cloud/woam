@@ -1,0 +1,19 @@
+#!/bin/sh
+# PAM open_session hook: snapshot state at login.
+#
+# The pair of this and woam-session-end is what makes the seal report ONLY what
+# changed while this agent was logged in. Without the opening snapshot, woam
+# diffs against a baseline taken long ago and reports everything the OS did in
+# between (log rotation, unattended upgrades, cron, package state) as though the
+# agent had done it.
+#
+# It must NEVER fail a login, so every path exits 0.
+set -u
+
+[ "${PAM_TYPE:-}" = "open_session" ] || exit 0
+
+WOAM_SESSION="${PAM_USER:-u}-${PAM_RHOST:-l}-$PPID"
+export WOAM_SESSION
+
+/usr/local/bin/woam session-open "$WOAM_SESSION" >>/var/log/woam-seal.log 2>&1 || true
+exit 0

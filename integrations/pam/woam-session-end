@@ -1,0 +1,31 @@
+#!/bin/sh
+# PAM close_session hook: seal the session when the agent leaves.
+#
+# `woam seal` still has to be CALLED, which is the same voluntary problem one
+# level up from `woam note`. This removes that: it fires when the ssh session
+# ends, interactive or not, whether or not the agent cooperated.
+#
+# Verified end to end with zero agent cooperation: an agent connected over ssh
+# non-interactively, changed an application env file, and exited without
+# recording anything. This hook sealed it by itself.
+#
+# It must NEVER fail a logout, so every path exits 0.
+set -u
+
+[ "${PAM_TYPE:-}" = "close_session" ] || exit 0
+
+# PAM runs this as root with no SSH_CLIENT, so woam's own actor() would record
+# `root@host` and lose who it actually was. PAM does export these.
+WOAM_ACTOR="${PAM_USER:-unknown}@${PAM_RHOST:-local}"
+export WOAM_ACTOR
+
+# Scope the diff to this login, so changes the OS made BEFORE the agent arrived
+# are not attributed to it. PAM exports no session id; $PPID is the sshd process
+# handling this connection and is the same value the open hook saw. If the two
+# do not line up, woam falls back to an unscoped seal rather than recording
+# nothing, and says so in the record.
+WOAM_SESSION="${PAM_USER:-u}-${PAM_RHOST:-l}-$PPID"
+export WOAM_SESSION
+
+/usr/local/bin/woam seal >>/var/log/woam-seal.log 2>&1 || true
+exit 0

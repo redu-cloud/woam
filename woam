@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+"""
+woam - machine memory for redu.cloud.
+
+WHAT THIS IS
+    A record of what changed on this machine and why, partitioned into functional
+    groups, so the next agent (or you, at 2am) does not rediscover it.
+
+THE ONE RULE
+    If you changed something in a group, record it. One command, a few tokens.
+    That is cheap against the thousands of tokens the next agent burns working it
+    out again, or worse, working from a wrong assumption.
+
+WHY IT IS BUILT THIS WAY
+    - Reading is a private good: the reader benefits, so it only has to be useful.
+    - Writing is a public good: the writer pays, someone else benefits. So it is
+      required, not requested. `woam status` fails while a group is unrecorded.
+    - Volatile facts are stored as a QUERY to run, never as an answer, so they
+      cannot go stale. A stale answer is worse than none: without it you check,
+      with it you trust.
+    - The log is append-only JSONL. One line per record, under PIPE_BUF, so
+      concurrent appends are atomic and a torn write costs one record, not the file.
+    - If you read something here that is WRONG, fixing it is your job: `woam fix`.
+      Nothing here is guaranteed correct. It is guaranteed honest about provenance.
+
+No dependencies beyond the Python 3 standard library. Runs on a redu VM, on a
+plain Ubuntu box, or on a laptop.
+"""
+
+import glob
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = 1
+ROOT = Path(os.environ.get("WOAM_ROOT", "/etc/redu"))
+LOG = ROOT / "changes.jsonl"
+BASELINE = ROOT / "baseline.json"
+SESSIONS = ROOT / "sessions"
+
+# One line, because it prints on every connection. Only INVARIANTS: nothing here
+# may be a port, an IP, or a status, because nothing regenerates it.
+BANNER = ("redu.cloud: this cloud has its own rules and they are written down. "
+          "Run `woam` before you debug or change anything.")
+
+# ---------------------------------------------------------------------------
+# GROUPS. Partitioned by what someone is trying to CHANGE, not by directory.
+#
+# Every path must map to exactly one group, and anything unmatched falls to
+# `host` - a path that maps to nothing would be a silent hole in the system
+# built to prevent silent holes.
+# ---------------------------------------------------------------------------
+# GROUPS -> SUBGROUPS -> paths.
+#
+# Two reasons for the second level, and speed is the one Milos asked for:
+#   1. LOCALISATION. "network/dns changed" beats "network changed".
+#   2. COST CONTROL. Each subgroup carries its own file budget, so one huge tree
+#      (an app checkout with a repo in it) cannot starve the cheap config paths
+#      that actually matter. Config subgroups are tiny and always fully checked;
+#      bulk subgroups are capped and say so.
+#
+# A group's digest is the hash of its subgroup digests, so a change is attributed
+# to a subgroup without rehashing anything else.
+#
+# Every path maps to exactly one subgroup. Unmatched falls to host/other, because
+# a path mapping to nothing would be a silent hole in the system built to prevent
+# silent holes.
+GROUPS = {
+    "app": {
+        "what": "the deployed application: its image, container, config and env",
+        "subs": {
+            # tiny + high value: never capped, always fully hashed
+            "unit":   {"paths": ["/etc/containers/systemd"], "budget": 200},
+            "env":    {"paths": ["/etc/redu-app"], "budget": 200, "keys": True},
+            "compose": {"paths": ["/opt/redu-compose", "/opt/app/docker-compose.yml",
+                                  "/opt/app/compose.yaml", "/opt/app/docker-compose.yaml"], "budget": 200},
+            # bulk: capped, changes here are usually a deploy rather than an edit
+            # /opt/app-src is where deploy_compose puts the project. It was MISSING, so a
+            # broken app's own files mapped to host/other and `woam show app` saw nothing -
+            # found 2026-08-05 by an agent fixing a real incident, where woam reported
+            # "all groups recorded" while the app was down.
+            "source": {"paths": ["/opt/app", "/opt/app-src", "/opt/redu-deploy",
+                                 "/opt/redu-compose"], "budget": 3000},
+        },
+        "probe": [("containers", "podman ps --format '{{.Names}} {{.Status}}' 2>/dev/null || docker ps 2>/dev/null"),
+                  ("images", "podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -5")],
+    },
+    "service": {
+        "what": "systemd units, what starts on boot, restart policy",
+        "subs": {
+            "local":  {"paths": ["/etc/systemd/system"], "budget": 800},
+            "vendor": {"paths": ["/lib/systemd/system", "/usr/lib/systemd/system"], "budget": 3000},
+        },
+        "probe": [("failed", "systemctl --failed --no-legend --no-pager"),
+                  ("enabled", "systemctl list-unit-files --state=enabled --no-legend --no-pager | head -10")],
+    },
+    "network": {
+        "what": "addressing, DNS, firewall, what is listening",
+        "subs": {
+            "addressing": {"paths": ["/etc/netplan", "/etc/network"], "budget": 200},
+            "dns":        {"paths": ["/etc/hosts", "/etc/resolv.conf"], "budget": 50},
+            "firewall":   {"paths": ["/etc/nftables.conf", "/etc/iptables", "/etc/ufw"], "budget": 300},
+        },
+        "probe": [("listening", "ss -ltnH 2>/dev/null | awk '{print $4}' | sort -u | head -10")],
+    },
+    "storage": {
+        "what": "mounts, volumes, disk layout",
+        "subs": {"mounts": {"paths": ["/etc/fstab"], "budget": 50},
+                 "volumes": {"paths": ["/etc/lvm", "/etc/mdadm"], "budget": 300}},
+        "probe": [("mounts", "findmnt -rno TARGET,SOURCE,FSTYPE -t ext4,xfs,nfs4,nfs 2>/dev/null | head -8"),
+                  ("free", "df -h --output=target,pcent -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2 | head -5")],
+    },
+    "packages": {
+        "what": "installed packages and where they come from",
+        "subs": {"sources":  {"paths": ["/etc/apt", "/etc/containers/registries.conf.d"], "budget": 300},
+                 "installed": {"paths": ["/var/lib/dpkg/status"], "budget": 10}},
+        "probe": [("count", "dpkg-query -f '.\\n' -W 2>/dev/null | wc -l")],
+    },
+    "access": {
+        "what": "who can get in and what they can do",
+        "subs": {
+            "users":  {"paths": ["/etc/passwd", "/etc/group"], "budget": 20},
+            "sudo":   {"paths": ["/etc/sudoers", "/etc/sudoers.d"], "budget": 100},
+            "sshd":   {"paths": ["/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d"], "budget": 100},
+            # metadata of the key FILES only. Never their content.
+            "keys":   {"paths": ["/root/.ssh/authorized_keys", "/home/*/.ssh/authorized_keys"], "budget": 100},
+        },
+        "probe": [("logins", "awk -F: '$3>=1000 && $1!=\"nobody\"{print $1}' /etc/passwd | head -5")],
+    },
+    "kernel": {
+        "what": "sysctl, modules, boot",
+        "subs": {"sysctl":  {"paths": ["/etc/sysctl.conf", "/etc/sysctl.d"], "budget": 200, "keys": True},
+                 "modules": {"paths": ["/etc/modules", "/etc/modules-load.d"], "budget": 100},
+                 "boot":    {"paths": ["/etc/default/grub"], "budget": 20}},
+        "probe": [("kernel", "uname -r")],
+    },
+    "schedule": {
+        "what": "cron jobs and timers",
+        "subs": {"cron": {"paths": ["/etc/cron.d", "/etc/crontab", "/etc/cron.daily", "/var/spool/cron"], "budget": 500}},
+        "probe": [("timers", "systemctl list-timers --no-legend --no-pager 2>/dev/null | head -5")],
+    },
+    "host": {
+        "what": "anything else on this machine (the catch-all, so nothing escapes)",
+        "subs": {"other": {"paths": [], "budget": 0}},
+        "probe": [("uptime", "uptime -p")],
+    },
+}
+
+
+def all_subs():
+    for g, gi in GROUPS.items():
+        for sname, si in gi["subs"].items():
+            yield g, sname, si
+
+
+def group_for(path: str) -> str:
+    """Map a path to exactly one group/sub. Longest prefix wins; unmatched -> host/other."""
+    p = os.path.abspath(path)
+    best, best_len = "host/other", -1
+    for g, sname, si in all_subs():
+        for root in si["paths"]:
+            root = root.replace("/*/", "/")          # glob roots compare on their literal stem
+            if (p == root or p.startswith(root.rstrip("/") + "/")) and len(root) > best_len:
+                best, best_len = f"{g}/{sname}", len(root)
+    return best
+
+
+def sh(cmd: str, timeout: int = 8) -> str:
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def actor() -> str:
+    """Best-effort identity. Never fabricates: unknown stays unknown."""
+    for env in ("WOAM_ACTOR", "CLAUDE_SESSION_ID", "SSH_CLIENT"):
+        v = os.environ.get(env)
+        if v:
+            return v.split()[0][:64]
+    return f"{os.environ.get('USER', 'unknown')}@{os.uname().nodename}"
+
+
+# ---------------------------------------------------------------------------
+# The log. One JSON object per line. RFC 8259 forbids a literal newline inside a
+# string, so the record delimiter cannot occur inside a record: the one-line
+# invariant is enforced by the grammar, not by convention.
+# ---------------------------------------------------------------------------
+def append(rec: dict) -> None:
+    rec = {"ts": now(), "v": VERSION, **rec}
+    line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
+    if len(line.encode()) > 3900:  # stay under PIPE_BUF so O_APPEND is atomic
+        rec["why"] = (rec.get("why") or "")[:600] + " ...(truncated)"
+        line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    # O_APPEND + a single write() is the atomic path. Never open("a") then print().
+    fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, (line + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def read_log() -> list:
+    if not LOG.exists():
+        return []
+    out = []
+    for line in LOG.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            # A torn final record costs one entry, never the file. This is the
+            # whole reason the log is JSONL and not a JSON array or YAML.
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Dirty detection. Hash the group's paths and compare to the recorded baseline.
+# No daemon: nothing to die, no privileges, works identically on a laptop.
+# ---------------------------------------------------------------------------
+# Directories that are large, machine-generated, and never the thing an agent
+# meant to change. Walking them is what made the first version unusable.
+PRUNE = {".git", "node_modules", "__pycache__", ".cache", ".venv", "venv",
+         "site-packages", ".next", "dist", "build", ".terraform", "vendor"}
+MAX_FILES = 4000       # per group; recorded when hit so the cap is never silent
+
+
+def _walk(root: Path, budget: int, blind=None):
+    """Yield files under root, pruning generated trees. Iterative: a deep tree
+    must not blow the stack, and a symlink loop must not hang."""
+    if root.is_file():
+        yield root
+        return
+    seen = set()
+    stack = [root]
+    while stack and budget > 0:
+        d = stack.pop()
+        try:
+            real = d.resolve()
+            if real in seen:          # symlink loop
+                continue
+            seen.add(real)
+            with os.scandir(d) as it:
+                for e in it:
+                    if budget <= 0:
+                        return
+                    try:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir():
+                            if e.name not in PRUNE and not e.name.startswith("."):
+                                stack.append(Path(e.path))
+                        elif e.is_file():
+                            budget -= 1
+                            yield Path(e.path)
+                    except OSError:
+                        continue
+        except (PermissionError, OSError):
+            # A directory we cannot descend is UNKNOWN, not empty. Swallowing this
+            # silently is what made woam report existing files as "removed".
+            if blind is not None:
+                blind.append(str(d))
+            continue
+
+
+KEY_RE = None   # compiled lazily; stdlib re imported at use site to keep startup cheap
+
+
+def key_digest(path: Path) -> dict:
+    """For KEY=VALUE config, record each key name -> a HASH of its value.
+
+    Names only, values never stored: this is the most-read file on the box and it
+    must never become where secrets leak. The hash is enough to say "this key
+    changed" without ever knowing what it changed to.
+
+    Live incident 2026-08-05 is why this exists: woam correctly named the .env as
+    the changed file, and an agent still had to open it and eyeball 20 keys to find
+    the one that mattered.
+    """
+    import re
+    global KEY_RE
+    if KEY_RE is None:
+        KEY_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*=(.*)$")
+    out = {}
+    try:
+        if path.stat().st_size > 262144:      # not a config file; do not parse it
+            return {}
+        for line in path.read_text(errors="replace").splitlines():
+            m = KEY_RE.match(line)
+            if m:
+                out[m.group(1)] = hashlib.sha256(m.group(2).strip().encode()).hexdigest()[:8]
+    except Exception:
+        return {}
+    return out
+
+
+def hash_sub(paths, budget, keys=False) -> dict:
+    """Digest one subgroup. METADATA only (path/size/mtime/mode).
+
+    Deliberately not content: reading every file took minutes on a real machine,
+    and a tool that slow is a tool nobody runs. Every case that matters here -
+    edit, rename, resize, replace, chmod - moves one of these fields.
+
+    Never raises. Anything unreadable is REPORTED, never silently skipped: a
+    "clean" that actually meant "I could not look" is the confidently-wrong
+    failure this whole tool exists to prevent.
+    """
+    h = hashlib.sha256()
+    n, capped, blind = 0, False, []
+    # Per-file metadata so a record can NAME the files. The agent should never have
+    # to author the WHAT - only the WHY. Cheap: ~100 bytes/file, ~80KB on a real VM.
+    files = {}
+    kmap = {}
+    for pattern in sorted(paths):
+        try:
+            roots = [Path(x) for x in glob.glob(pattern)] if "*" in pattern else [Path(pattern)]
+        except Exception:
+            blind.append(pattern); continue
+        for p in roots:
+            try:
+                if not p.exists():
+                    continue
+            except Exception:
+                blind.append(str(p)); continue
+            try:
+                for f in _walk(p, budget - n, blind):
+                    try:
+                        st = f.stat()
+                    except Exception:
+                        blind.append(str(f)); continue
+                    sig = f"{st.st_size}:{int(st.st_mtime)}:{st.st_mode}"
+                    h.update(f"{f}:{sig}\n".encode())
+                    files[str(f)] = sig
+                    if keys:
+                        k = key_digest(f)
+                        if k:
+                            kmap[str(f)] = k
+                    n += 1
+                    if n >= budget:
+                        capped = True
+                        break
+            except Exception:
+                blind.append(str(p)); continue
+    return {"hash": h.hexdigest()[:16], "files": n, "capped": capped,
+            "blind": blind[:5], "f": files, "k": kmap}
+
+
+def diff_files(before: dict, after: dict, blind=None) -> dict:
+    """Exact filenames, split by how they changed.
+
+    CRITICAL: a file we could not READ this pass is UNKNOWN, never "removed".
+    Found 2026-08-05 by an agent fixing a real incident: baselined as root, then run
+    as an unprivileged user, woam reported /root/.ssh/authorized_keys and two
+    /etc/sudoers.d files as REMOVED. They existed. That is worse than a silent gap -
+    it FABRICATES a security-relevant event, and it flatly contradicted this tool's
+    own promise that "clean" never means "I could not look".
+    """
+    b, a = set(before or {}), set(after or {})
+    blind = [str(x).rstrip("/") for x in (blind or [])]
+
+    def unreadable(path: str) -> bool:
+        return any(path == x or path.startswith(x + "/") for x in blind)
+
+    gone = sorted(b - a)
+    return {
+        "modified": sorted(p for p in (b & a) if before[p] != after[p]),
+        "created": sorted(a - b),
+        # only paths we could actually LOOK at and did not find
+        "removed": [p for p in gone if not unreadable(p)],
+        # seen before, unreadable now: reported honestly as unknown
+        "unreadable": [p for p in gone if unreadable(p)],
+    }
+
+
+def diff_keys(before: dict, after: dict) -> list:
+    """Which CONFIG KEYS changed. Names only - never a value, before or after."""
+    out = []
+    for path in sorted(set(before or {}) | set(after or {})):
+        b, a = (before or {}).get(path, {}), (after or {}).get(path, {})
+        for k in sorted(set(b) | set(a)):
+            if b.get(k) != a.get(k):
+                verb = "changed" if (k in b and k in a) else ("added" if k in a else "removed")
+                out.append(f"{k} {verb}")
+    return out
+
+
+def hash_group(name: str) -> dict:
+    """Merkle: the group digest is the hash of its subgroup digests, so a change
+    is attributed to a subgroup without rehashing anything else."""
+    subs, roll = {}, hashlib.sha256()
+    for sname in sorted(GROUPS[name]["subs"]):
+        si = GROUPS[name]["subs"][sname]
+        if not si["paths"]:
+            continue
+        r = hash_sub(si["paths"], si["budget"], si.get("keys", False))
+        subs[sname] = r
+        roll.update(f"{sname}:{r['hash']}\n".encode())
+    return {"hash": roll.hexdigest()[:16], "subs": subs}
+
+
+def load_baseline() -> dict:
+    try:
+        return json.loads(BASELINE.read_text())
+    except Exception:
+        return {}
+
+
+def save_baseline(b: dict) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = BASELINE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(b, indent=1, sort_keys=True))
+    os.replace(tmp, BASELINE)   # atomic; a reader never sees a half file
+
+
+def dirty_groups(against=None) -> dict:
+    """Which SUBGROUPS differ. Sub-level, because 'network/dns changed' is
+    actionable and 'network changed' is not.
+
+    `against` is a SESSION snapshot taken at login. When present, the diff covers
+    only what changed while that agent was logged in - which is the only thing an
+    AGENT memory should ever claim. Falling back to the long-lived baseline reports
+    the OS's own work as the agent's."""
+    base = against if against is not None else load_baseline()
+    out = {}
+    for name in GROUPS:
+        try:
+            cur = hash_group(name)
+        except Exception:
+            # A group we cannot hash is UNKNOWN, never "unchanged".
+            out[name] = {"since": "unknown", "subs": [("<unreadable>", 0)], "files": 0}
+            continue
+        prev = base.get(name, {})
+        if not prev.get("hash"):
+            continue                      # never baselined: not a change
+        if prev["hash"] == cur["hash"]:
+            continue
+        changed, named = [], {}
+        for sname, r in cur["subs"].items():
+            pv = (prev.get("subs") or {}).get(sname, {})
+            if pv.get("hash") == r["hash"]:
+                continue
+            d = diff_files(pv.get("f"), r.get("f"), r.get("blind"))
+            d["keys"] = diff_keys(pv.get("k"), r.get("k"))
+            total = len(d["modified"]) + len(d["created"]) + len(d["removed"])
+            if total == 0 and d.get("unreadable"):
+                # Nothing actually changed that we could see; we just lost visibility.
+                # Reporting this as a change sends the next agent chasing a phantom.
+                continue
+            changed.append((sname, total or r["files"]))
+            named[sname] = d
+        # The group digest can differ purely because we lost VISIBILITY this pass.
+        # Reporting that as an unrecorded change sends the next agent chasing a
+        # phantom, which is the same fabrication the "removed" bug caused.
+        if not changed:
+            continue
+        out[name] = {"since": prev.get("ts", "unknown"), "subs": changed,
+                     "named": named, "files": sum(c for _, c in changed)}
+    return out
+
+
+def rebaseline(names=None) -> None:
+    base = load_baseline()
+    for name in (names or list(GROUPS)):
+        try:
+            r = hash_group(name)
+        except Exception:
+            continue
+        base[name] = {**r, "ts": now()}
+    save_baseline(base)
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+def cmd_status(argv) -> int:
+    dirty = dirty_groups()
+    entries = read_log()
+    print(BANNER)
+    print()
+    print(f"machine  {os.uname().nodename}    groups {len(GROUPS)}    records {len(entries)}")
+    base = load_baseline()
+    blind = {}
+    for g, gi in base.items():
+        for sname, r in (gi.get("subs") or {}).items():
+            if r.get("blind"):
+                blind[f"{g}/{sname}"] = r["blind"]
+    if blind:
+        # "clean" must never silently mean "I could not look".
+        print(f"\n  NOT FULLY VISIBLE (run as root for a complete picture):")
+        for n, paths in blind.items():
+            print(f"    {n:9s} could not read {len(paths)} path(s), e.g. {paths[0]}")
+
+    closed = {e.get("id") for e in entries if e.get("ev") == "gap_closed"}
+    gaps = [e for e in entries if e.get("ev") == "gap" and e.get("id") not in closed]
+    if gaps:
+        print(f"\n  {len(gaps)} unexplained change(s):  woam gaps")
+
+    if dirty:
+        print("\n  UNRECORDED CHANGES - these groups changed and nothing says why:\n")
+        for name, d in dirty.items():
+            subs = ", ".join(f"{sn}({fc})" for sn, fc in d["subs"]) or "?"
+            print(f"    {name:9s} {subs}   since {d['since']}")
+            for sname, dd in (d.get("named") or {}).items():
+                for kind in ("modified", "created", "removed"):
+                    for f in dd[kind][:4]:
+                        print(f"    {'':9s}   {kind[:3]}  {f}")
+                    extra = len(dd[kind]) - 4
+                    if extra > 0:
+                        print(f"    {'':9s}   {'':3s}  ... and {extra} more {kind}")
+                for kd in (dd.get("keys") or [])[:6]:
+                    print(f"    {'':9s}   KEY  {kd}")
+                for u in (dd.get("unreadable") or [])[:3]:
+                    print(f"    {'':9s}   ??   {u}  (seen before, UNREADABLE now - not deleted)")
+            print(f"    {'':9s} record it:  woam note {name} \"what you did and why\"")
+            print(f"    {'':9s} or defer:   woam note {name} --defer \"reason unknown\"")
+        print("\n  Writing costs a few tokens. Not writing costs the next agent thousands,")
+        print("  or worse, sends it down a path that does not work here.")
+        return 1                       # non-zero: `woam status && deploy` stops
+    if not load_baseline():
+        # A fresh install has nothing to compare against. Reporting "all clean"
+        # here would be the confidently-wrong failure this tool exists to prevent.
+        print("\n  NO BASELINE on this machine - nothing has been recorded to compare against.")
+        print("  This is not 'clean'. It means woam cannot yet tell you what changed.")
+        print("    take one:  woam baseline")
+        return 1
+    print("\n  all groups recorded")
+    return 0
+
+
+def cmd_show(argv) -> int:
+    name = argv[0] if argv else None
+    if name and name not in GROUPS:
+        print(f"unknown group '{name}'. known: {', '.join(GROUPS)}", file=sys.stderr)
+        return 2
+    names = [name] if name else list(GROUPS)
+    entries = read_log()
+    for g in names:
+        info = GROUPS[g]
+        print(f"\n=== {g} - {info['what']} ===")
+        recs = [e for e in entries if e.get("group") == g][-5:]
+        if recs:
+            print("  recorded:")
+            for e in recs:
+                mark = "?" if e.get("deferred") else "-"
+                print(f"    {mark} {e['ts']}  {e.get('why', '')[:90]}")
+                # `what` is the machine-derived list of what changed; `files` is a
+                # COUNT. Subscripting the count threw TypeError and took the whole
+                # command down, on the exact path that matters: a note recorded
+                # against a group that had actually changed. On a clean group
+                # `files` is None, so every manual test passed. Caught by
+                # test/smoke.sh, which notes against a group it made dirty first.
+                for w in (e.get("what") or [])[:3]:
+                    print(f"        {w}")
+                n = e.get("files")
+                if isinstance(n, int) and n > 3:
+                    print(f"        ... and {n - 3} more file(s) changed")
+        else:
+            # Honest emptiness. A confident wrong answer kills trust in one shot;
+            # an honest blank keeps the habit alive.
+            print("  recorded: nothing yet for this group")
+        if info["probe"]:
+            print("  check current state (these are commands, not stored answers):")
+            for label, cmd in info["probe"]:
+                print(f"    {label:11s} {cmd}")
+    return 0
+
+
+def cmd_note(argv) -> int:
+    if not argv:
+        print("usage: woam note <group> \"what you did and why\" [--defer]", file=sys.stderr)
+        return 2
+    group, rest = argv[0], argv[1:]
+    if group not in GROUPS:
+        print(f"unknown group '{group}'. known: {', '.join(GROUPS)}", file=sys.stderr)
+        return 2
+    deferred = "--defer" in rest
+    why = " ".join(a for a in rest if a != "--defer").strip()
+    if not why:
+        print("say what you did. one line is enough.", file=sys.stderr)
+        return 2
+
+    d = dirty_groups().get(group, {})
+    # The WHAT is machine-derived; the agent supplies only the WHY. Capped so the
+    # record stays one line under PIPE_BUF and the append stays atomic.
+    what = []
+    for sname, dd in (d.get("named") or {}).items():
+        for kind in ("modified", "created", "removed"):
+            for f in dd[kind][:5]:
+                what.append(f"{kind[:3]}:{sname}:{f}")
+        for kd in (dd.get("keys") or [])[:8]:
+            what.append(f"key:{sname}:{kd}")
+    append({"ev": "note", "group": group, "why": why, "by": actor(),
+            "deferred": deferred, "subs": [sn for sn, _ in d.get("subs", [])],
+            "what": what[:20], "files": d.get("files")})
+    rebaseline([group])
+    print(f"recorded against {group}" + ("  (deferred: no cause given)" if deferred else ""))
+    return 0
+
+
+def session_file(sid: str) -> Path:
+    safe = "".join(c for c in str(sid) if c.isalnum() or c in "-_")[:64] or "unknown"
+    return SESSIONS / f"{safe}.json"
+
+
+def cmd_session_open(argv) -> int:
+    """Snapshot state at the START of a session, so the seal at the end reports ONLY
+    what changed WHILE THIS AGENT WAS LOGGED IN.
+
+    Without this, woam diffs against a baseline taken long ago and reports every
+    change the OS made since - log rotation, unattended-upgrades, cron, package
+    state - as though the agent had done it. On 2026-08-05 that produced a claim
+    that /root/.ssh/authorized_keys and two /etc/sudoers.d files had been DELETED.
+    Nothing had touched them and no agent was involved.
+
+    An agent memory must record what the AGENT did. Other actors on the box are not
+    its business, and attributing their work to it is a lie that costs a session.
+    """
+    sid = argv[0] if argv else os.environ.get("WOAM_SESSION") or str(os.getpid())
+    snap = {}
+    for name in GROUPS:
+        try:
+            snap[name] = hash_group(name)
+        except Exception:
+            continue
+    SESSIONS.mkdir(parents=True, exist_ok=True)
+    f = session_file(sid)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"ts": now(), "by": actor(), "groups": snap}))
+    os.replace(tmp, f)
+    print(f"session {sid} opened")
+    return 0
+
+
+def cmd_seal(argv) -> int:
+    """Record what changed when NOBODY explained it. The abandoned-session case.
+
+    This is the half that matters most and the half an agent will never do
+    voluntarily: the LAST write, at the moment the work is finished, when the
+    agent has no remaining stake. So it must not depend on the agent at all -
+    the WHAT is machine-derived and the WHY is recorded as explicitly MISSING,
+    with an id so it can be closed later by whoever works it out.
+
+    An honest "nobody said why" beats both silence and a fabricated reason: the
+    next agent learns the state changed AND that the reasoning is unknown, so it
+    verifies instead of trusting.
+    """
+    sid = None
+    if "--session" in argv:
+        i = argv.index("--session")
+        sid = argv[i + 1] if i + 1 < len(argv) else None
+    sid = sid or os.environ.get("WOAM_SESSION")
+    prev = None
+    if sid:
+        try:
+            prev = json.loads(session_file(sid).read_text()).get("groups")
+        except Exception:
+            prev = None            # no snapshot: fall back, but say so
+    dirty = dirty_groups(prev)
+    if not dirty:
+        print("nothing unrecorded" + (f" for session {sid}" if sid else ""))
+        if sid:
+            try: session_file(sid).unlink()
+            except Exception: pass
+        return 0
+    sealed = 0
+    for group, d in dirty.items():
+        what = []
+        for sname, dd in (d.get("named") or {}).items():
+            for kind in ("modified", "created", "removed"):
+                for f in dd[kind][:5]:
+                    what.append(f"{kind[:3]}:{sname}:{f}")
+            for kd in (dd.get("keys") or [])[:8]:
+                what.append(f"key:{sname}:{kd}")
+        gid = hashlib.sha256(f"{group}{now()}{d.get('files')}".encode()).hexdigest()[:6]
+        append({"ev": "gap", "id": gid, "group": group, "by": actor(),
+                "subs": [sn for sn, _ in d.get("subs", [])], "what": what[:20],
+                "files": d.get("files"), "why": None, "closed": False})
+        print(f"  {gid}  {group}: {d.get('files')} file(s) changed, WHY NOT RECORDED")
+        for w in what[:4]:
+            print(f"          {w}")
+        sealed += 1
+    rebaseline(list(dirty))
+    if sid:
+        try: session_file(sid).unlink()
+        except Exception: pass
+    print(f"\nsealed {sealed} group(s) with the reason marked MISSING.")
+    print("Close one when you work it out:  woam why <id> \"...\"")
+    return 0
+
+
+def cmd_why(argv) -> int:
+    """Close a gap after the fact. Records WHEN it was explained as well as when
+    it happened, so the record stays honest about how the knowledge was acquired."""
+    if len(argv) < 2:
+        print("usage: woam why <id> \"what actually happened\"   (or --unknown \"...\")", file=sys.stderr)
+        return 2
+    gid, rest = argv[0], argv[1:]
+    unknown = "--unknown" in rest
+    why = " ".join(a for a in rest if a != "--unknown").strip()
+    if not why:
+        print("say something, even if it is that the cause is not established.", file=sys.stderr)
+        return 2
+    target = None
+    for e in read_log():
+        if e.get("ev") == "gap" and e.get("id") == gid:
+            target = e
+    if not target:
+        print(f"no open gap with id '{gid}'. list them:  woam gaps", file=sys.stderr)
+        return 2
+    append({"ev": "gap_closed", "id": gid, "group": target.get("group"),
+            "why": why, "unknown": unknown, "by": actor(),
+            "happened_at": target.get("ts")})
+    print(f"closed {gid}" + ("  (cause NOT established - recorded as unknown)" if unknown else ""))
+    return 0
+
+
+def cmd_fix(argv) -> int:
+    """Correcting a wrong entry is the reader's job. Nothing here is guaranteed
+    correct; it is guaranteed honest. A correction is a new record, never an
+    edit - the log is append-only and history is not rewritten."""
+    if len(argv) < 2:
+        print("usage: woam fix <group> \"what is actually true\"", file=sys.stderr)
+        return 2
+    group, why = argv[0], " ".join(argv[1:]).strip()
+    if group not in GROUPS:
+        print(f"unknown group '{group}'. known: {', '.join(GROUPS)}", file=sys.stderr)
+        return 2
+    append({"ev": "fix", "group": group, "why": why, "by": actor()})
+    print(f"correction recorded against {group}")
+    return 0
+
+
+def cmd_gaps(argv) -> int:
+    entries = read_log()
+    closed = {e.get("id") for e in entries if e.get("ev") == "gap_closed"}
+    gaps = [e for e in entries if e.get("ev") == "gap" and e.get("id") not in closed]
+    if not gaps:
+        print("no unexplained changes")
+        return 0
+    for e in gaps:
+        print(f"\n{e.get('id', '?')}  {e['ts']}  group={e.get('group')}  by={e.get('by','?')}")
+        for w in (e.get("what") or [])[:6]:
+            print(f"    {w}")
+        print("  WHY: not recorded - the session ended without an explanation")
+        print(f"  close it:    woam why {e.get('id')} \"...\"")
+        print(f"  or admit it: woam why {e.get('id')} --unknown \"cause not established\"")
+    return 0
+
+
+def cmd_log(argv) -> int:
+    for e in read_log()[-30:]:
+        print(json.dumps(e, separators=(",", ":")))
+    return 0
+
+
+def cmd_groups(argv) -> int:
+    print("path -> group/subgroup. every path maps to exactly one; unmatched -> host/other.\n")
+    for name, g in GROUPS.items():
+        print(f"  {name}  -  {g['what']}")
+        for sname, si in g["subs"].items():
+            paths = ", ".join(si["paths"]) or "(catch-all)"
+            print(f"      {sname:11s} budget {si['budget']:>5}  {paths}")
+    return 0
+
+
+def cmd_which(argv) -> int:
+    if not argv:
+        print("usage: woam which <path>", file=sys.stderr)
+        return 2
+    for p in argv:
+        print(f"{group_for(p):9s} {p}")
+    return 0
+
+
+COMMANDS = {
+    "status": cmd_status, "show": cmd_show, "note": cmd_note, "fix": cmd_fix,
+    "gaps": cmd_gaps, "log": cmd_log, "groups": cmd_groups, "which": cmd_which,
+    "seal": cmd_seal, "why": cmd_why, "session-open": cmd_session_open,
+    "baseline": lambda a: (rebaseline(a or None), print("baseline recorded"), 0)[-1],
+}
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv:
+        return cmd_status([])
+    cmd, rest = argv[0], argv[1:]
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        print("commands: " + "  ".join(COMMANDS))
+        return 0
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        print(f"unknown command '{cmd}'. try: {'  '.join(COMMANDS)}", file=sys.stderr)
+        return 2
+    try:
+        return fn(rest)
+    except Exception as e:                           # noqa: BLE001 - deliberate
+        print(f"woam {cmd}: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    # NOTHING may ever raise out of woam. It is the audit path: a crash here means
+    # an agent gets a stack trace instead of a record, concludes the tool is broken,
+    # and stops using it - which loses the memory permanently, not just this once.
+    # A traceback is never a useful answer to "what changed on this machine".
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except BaseException as e:                       # noqa: BLE001 - deliberate
+        # Degrade to a truthful, actionable failure. Exit 1, not 0: an error is
+        # NOT a clean bill of health, and treating it as one is exactly the
+        # confidently-wrong failure this tool exists to prevent.
+        print(f"woam: internal error ({type(e).__name__}: {e})", file=sys.stderr)
+        print("woam: could not determine this machine's state. Do NOT read this as 'clean'.",
+              file=sys.stderr)
+        if os.environ.get("WOAM_DEBUG"):
+            import traceback; traceback.print_exc()
+        sys.exit(1)
