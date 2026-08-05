@@ -243,6 +243,37 @@ t "history is not rewritten: a gap_closed record is appended" "$(has 'gap_closed
 t "and it records that the explanation came via a note" "$(has '"via":"note"')"
 
 echo
+echo "[13c] a change made from OFF the machine can still be recorded ON it"
+# The last hole: an agent that rotates a credential through an HTTPS API from its own
+# laptop changes the machine and leaves nothing on it - no file moved, no command ran
+# there, so no watch and no audit record could ever exist. Measured today, exactly that
+# happened and `woam status` on the VM said "all groups recorded". The agent knows what it
+# did, so it writes the record itself and syncs it.
+export WOAM_CLAIMS="$WOAM_ROOT/claims.jsonl"
+CLAIM=$("$WOAM" claim app "rotated the admin password from off-box" 2>/dev/null)
+t "claim emits one JSON line" "$(echo "$CLAIM" | python3 -c 'import sys,json;json.loads(sys.stdin.readline());print()' >/dev/null 2>&1 && echo 0 || echo 1)" "$CLAIM"
+t "and the operator's own machine keeps a copy" "$([ -s "$WOAM_CLAIMS" ] && echo 0 || echo 1)"
+t "the claim is marked as remote-origin, never as evidence" \
+  "$(echo "$CLAIM" | grep -q '"by_evidence":"claimed-remote"' && echo 0 || echo 1)"
+t "and its actor is prefixed so it cannot read as an audited one" \
+  "$(echo "$CLAIM" | grep -q '"by":"claimed:' && echo 0 || echo 1)"
+
+echo "$CLAIM" | run accept >/dev/null
+t "accept lands it on this machine" "$(has 'accepted a remote claim against app')"
+run show app >/dev/null
+t "and the reader is TOLD it is a claim, not evidence" "$(has 'CLAIMED from off this machine')"
+t "marked distinctly from an audited record" "$(has '~ ')"
+
+rc=$(echo 'not json' | run accept)
+t "garbage on stdin is refused" "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got exit $rc"
+rc=$(echo '{"why":"x","group":"nope"}' | run accept)
+t "a claim for an unknown group is refused" "$([ "$rc" = 2 ] && echo 0 || echo 1)" "got exit $rc"
+# The sender cannot promote its own record: accept RE-STAMPS the evidence field.
+echo '{"group":"app","why":"forged","by":"root(auid=0,ses=1)","by_evidence":"agent"}' | run accept >/dev/null
+run log >/dev/null
+t "a sender CANNOT forge audited-looking evidence" "$(hasnt '\"by_evidence\":\"agent\"')"
+
+echo
 echo "[14] the installer's ORDER, which a real first boot proved is not cosmetic"
 # Measured on a fresh VM: with the baseline taken BEFORE the auditd install,
 # installing auditd itself showed up as an unrecorded change and the first `woam` an

@@ -1246,7 +1246,15 @@ def cmd_show(argv) -> int:
         if recs:
             print("  recorded:")
             for e in recs:
-                mark = "?" if e.get("deferred") else "-"
+                # A claim must LOOK like a claim. Printing it identically to an audited
+                # record is how a self-declared statement quietly acquires the authority
+                # of kernel evidence, which is the one thing this tool must never do.
+                if e.get("by_evidence") == "claimed-remote":
+                    mark = "~"
+                elif e.get("deferred"):
+                    mark = "?"
+                else:
+                    mark = "-"
                 # `.get("why", "")` returns None when the key EXISTS and is null, which is
                 # exactly what a `gap` record is: why=None by construction. Since sealing
                 # became automatic, gaps are the COMMON record, so `woam show` crashed on
@@ -1256,6 +1264,9 @@ def cmd_show(argv) -> int:
                 why = e.get("why") or ("(sealed automatically - nobody said why)"
                                        if e.get("ev") == "gap" else "")
                 print(f"    {mark} {e['ts']}  {why[:90]}")
+                if e.get("by_evidence") == "claimed-remote":
+                    print(f"        CLAIMED from off this machine by {e.get('by', '?')}, "
+                          f"not verifiable here")
                 # `what` is the machine-derived list of what changed; `files` is a
                 # COUNT. Subscripting the count threw TypeError and took the whole
                 # command down, on the exact path that matters: a note recorded
@@ -1571,6 +1582,105 @@ def cmd_which(argv) -> int:
     return 0
 
 
+def cmd_claim(argv) -> int:
+    """Record a change you made to a machine FROM OUTSIDE it.
+
+    The hole this closes: an agent that rotates a credential through an HTTPS API from its
+    own laptop changes the machine and leaves nothing on it. No file moved, no command ran
+    there, so no watch and no audit record could ever exist. Measured today: exactly that
+    happened, and `woam status` on the VM said "all groups recorded".
+
+    The agent always knows what it did. So it writes the record itself, here, and syncs it:
+
+        woam claim app "rotated the keycloak master admin password" | \\
+            ssh <vm> 'sudo woam accept'
+
+    What this is NOT is evidence. There is no auid on that machine for a request that
+    arrived over the network, and pretending otherwise would put a fabricated actor next
+    to real kernel records. So the record carries the LOCAL identity, is marked
+    `claimed-remote`, and `woam show` prints it as a claim. An honest claim beside honest
+    evidence is useful; a claim dressed as evidence poisons both.
+    """
+    if len(argv) < 2:
+        print('usage: woam claim <group> "what you did and why"', file=sys.stderr)
+        print("       pipe it to `ssh <host> woam accept` to land it on that machine",
+              file=sys.stderr)
+        return 2
+    group, why = argv[0], " ".join(argv[1:]).strip()
+    if group not in GROUPS:
+        print(f"unknown group '{group}'. known: {', '.join(GROUPS)}", file=sys.stderr)
+        return 2
+    if not why:
+        print("say what you did. one line is enough.", file=sys.stderr)
+        return 2
+    auid, ses = self_login()
+    rec = {
+        "ts": now(), "v": VERSION, "ev": "claim", "group": group, "why": why[:600],
+        "origin": "remote",
+        # Deliberately prefixed. It must be impossible to read this as an audited actor.
+        "by": f"claimed:{uid_name(auid) if auid not in (None, AUID_UNSET) else os.environ.get('USER', 'unknown')}"
+              f"@{os.uname().nodename}",
+        "by_evidence": "claimed-remote",
+        "claims": claimed_actor(),
+    }
+    # Keep a copy where it was made, so the operator's own machine remembers what it did
+    # to other people's machines even if the sync never happens.
+    try:
+        local = Path(os.environ.get("WOAM_CLAIMS", Path.home() / ".woam" / "claims.jsonl"))
+        local.parent.mkdir(parents=True, exist_ok=True)
+        with local.open("a") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":"), ensure_ascii=False) + "\n")
+    except Exception:
+        pass                                  # never fail the emit because the copy failed
+    print(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
+    return 0
+
+
+def cmd_accept(argv) -> int:
+    """Land a claim made from off this machine, on this machine's record.
+
+    Reads one JSON claim on stdin. Never trusts it: the record is re-stamped as
+    `claimed-remote` here, so nothing arriving over a pipe can present itself as an
+    audited write no matter what it contains.
+
+    This adds no privilege. Anyone who can run it already has shell here and could append
+    to the log directly; the point is that the record lands in the RIGHT shape.
+    """
+    raw = sys.stdin.read(8000)
+    try:
+        rec = json.loads(raw.strip().splitlines()[0]) if raw.strip() else None
+    except Exception:
+        rec = None
+    if not isinstance(rec, dict) or not rec.get("why"):
+        print("woam accept: expected one JSON claim on stdin (from `woam claim`)",
+              file=sys.stderr)
+        return 2
+    group = rec.get("group")
+    if group not in GROUPS:
+        print(f"woam accept: unknown group {group!r}", file=sys.stderr)
+        return 2
+    append({
+        "ev": "claim", "group": group, "why": str(rec.get("why"))[:600],
+        # Re-stamped HERE. Whatever the sender put in these fields is discarded.
+        "origin": "remote", "by_evidence": "claimed-remote",
+        "by": str(rec.get("by", "claimed:unknown"))[:80],
+        "claimed_at": str(rec.get("ts", ""))[:32],
+        "accepted_by": actor(),
+    })
+    # A claim explains a group; close anything the timer sealed on it, same as a note.
+    closed = 0
+    already = {e.get("id") for e in read_log() if e.get("ev") == "gap_closed"}
+    for e in read_log():
+        if e.get("ev") == "gap" and e.get("group") == group and e.get("id") not in already:
+            append({"ev": "gap_closed", "id": e["id"], "group": group,
+                    "why": str(rec.get("why"))[:600], "by": actor(),
+                    "happened_at": e.get("ts"), "via": "claim"})
+            closed += 1
+    print(f"accepted a remote claim against {group}"
+          + (f"; closed {closed} open gap(s)" if closed else ""))
+    return 0
+
+
 def cmd_who(argv) -> int:
     """Who wrote this path, on the kernel's evidence. The question the diff engine can
     never answer, and the reason this layer exists."""
@@ -1726,7 +1836,7 @@ COMMANDS = {
     "status": cmd_status, "show": cmd_show, "note": cmd_note, "fix": cmd_fix,
     "gaps": cmd_gaps, "log": cmd_log, "groups": cmd_groups, "which": cmd_which,
     "seal": cmd_seal, "why": cmd_why, "session-open": cmd_session_open,
-    "who": cmd_who, "audit-rules": cmd_audit_rules, "audit-status": cmd_audit_status,
+    "who": cmd_who, "claim": cmd_claim, "accept": cmd_accept, "audit-rules": cmd_audit_rules, "audit-status": cmd_audit_status,
     "audit-install": cmd_audit_install,
     "baseline": lambda a: (rebaseline(a or None), print("baseline recorded"), 0)[-1],
 }
