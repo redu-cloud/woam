@@ -103,6 +103,38 @@ GROUPS = {
             # have measured the write volume of the app in question.
             "source": {"paths": ["/opt/app", "/opt/app-src", "/opt/redu-deploy",
                                  "/opt/redu-compose"], "budget": 3000, "audit": False},
+            # THE CONTAINER LAYER. Derived from the engine, not from files, because this
+            # is where an agent actually works and almost none of it shows up as a write
+            # to a watched config path. A restart, a recreate, an image swap, a container
+            # that has started dying - all invisible to a filesystem diff, all things the
+            # next agent needs to know and would otherwise have to go digging through
+            # docker/podman to reconstruct.
+            #
+            # Identities and names only. Never values, never env contents, never volume
+            # data (that last one is the flood that made `source` audit:False).
+            # StartedAt, not Status. `docker ps` gives "Up 20 minutes", which ticks every
+            # minute and would make the group permanently dirty, so the obvious fix is to
+            # normalise it to "Up" - and that erases the restart, which is the single
+            # thing most worth catching. Measured: with Status normalised, restarting a
+            # container fired nothing at all.
+            #
+            # StartedAt changes ONLY on a restart. The container id changes on a recreate,
+            # the image ref on a swap, RestartCount on a crash loop. Idle ticking moves
+            # none of them.
+            "containers": {
+                "paths": [], "budget": 400,
+                "derive": "for e in podman docker; do command -v $e >/dev/null 2>&1 || continue; "
+                          "ids=$($e ps -aq 2>/dev/null); [ -n \"$ids\" ] || continue; "
+                          "$e inspect --format "
+                          "'{{.Name}} img={{.Config.Image}} started={{.State.StartedAt}} "
+                          "restarts={{.RestartCount}} state={{.State.Status}}' "
+                          "$ids 2>/dev/null; done | sort -u",
+            },
+            "images": {
+                "paths": [], "budget": 200,
+                "derive": "{ podman images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null; "
+                          "docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null; } | sort -u",
+            },
         },
         "probe": [("containers", "podman ps --format '{{.Names}} {{.Status}}' 2>/dev/null || docker ps 2>/dev/null"),
                   ("images", "podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | head -5")],
@@ -764,12 +796,48 @@ def hash_group(name: str) -> dict:
     subs, roll = {}, hashlib.sha256()
     for sname in sorted(GROUPS[name]["subs"]):
         si = GROUPS[name]["subs"][sname]
-        if not si["paths"]:
+        if si.get("derive"):
+            r = hash_derived(si["derive"])
+        elif si["paths"]:
+            r = hash_sub(si["paths"], si["budget"], si.get("keys", False))
+        else:
             continue
-        r = hash_sub(si["paths"], si["budget"], si.get("keys", False))
         subs[sname] = r
         roll.update(f"{sname}:{r['hash']}\n".encode())
     return {"hash": roll.hexdigest()[:16], "subs": subs}
+
+
+def hash_derived(cmd: str) -> dict:
+    """State that is not a file.
+
+    Filesystem diffing misses most of what an agent actually DOES. It restarts a service,
+    recreates a container, swaps an image, changes a setting through an API - and not one
+    byte moves in a watched config path, so the gate never fires and nobody is asked to
+    explain it. Measured on a live deploy: an agent created a user and rotated an admin
+    password through an HTTP API, and `woam status` said "all groups recorded" and exited
+    0. The next agent would read the repo's own notes, see a default credential, and
+    believe it.
+
+    So a subgroup can derive its state from a COMMAND instead of a path. The output lines
+    are treated exactly like filenames: hashed, diffed, and named in the report. Container
+    inventory is the first user of this and the most important one, because the container
+    layer is where an agent works.
+
+    Values are never captured, only names and identities. `docker ps` gives names, images
+    and restart counts; it does not give secrets.
+    """
+    out = sh(cmd, timeout=10)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    files = {l: hashlib.sha256(l.encode()).hexdigest()[:8] for l in sorted(lines)[:400]}
+    h = hashlib.sha256()
+    for k in sorted(files):
+        h.update(f"{k}\n".encode())
+    # `blind` when the command produced nothing: an engine that is not installed and an
+    # engine with no containers must not look the same. One is "nothing to see", the other
+    # is "I could not look", and conflating them is how a clean report gets fabricated.
+    blind = [] if out else [f"(no output from: {cmd[:60]})"]
+    return {"hash": h.hexdigest()[:16], "files": len(files), "capped": False,
+            "blind": blind, "f": files, "k": {}}
 
 
 def load_baseline() -> dict:
@@ -871,10 +939,25 @@ def classify_dirty(dirty: dict):
     """
     agent, system = {}, {}
     for name, d in dirty.items():
-        paths = []
-        for _sname, dd in (d.get("named") or {}).items():
+        paths, derived_only = [], True
+        for sname, dd in (d.get("named") or {}).items():
+            # A derived subgroup's "paths" are container descriptors, not files. Feeding
+            # them to the audit layer produced "these paths are not watched", which is a
+            # statement about the filesystem and simply does not apply: no file changed,
+            # so auditd has nothing to say and never could. Wrong admission is still a
+            # wrong answer.
+            if (GROUPS.get(name, {}).get("subs", {}).get(sname, {}) or {}).get("derive"):
+                continue
+            derived_only = False
             for kind in ("modified", "created", "removed"):
                 paths.extend(dd.get(kind) or [])
+        if derived_only:
+            # Engine-reported state. We know exactly WHAT changed and the actor is not
+            # recoverable from a file watch. The agent still owes the WHY - that is the
+            # whole point of catching it.
+            d["verdict"], d["actors"], d["last_write"] = "derived", [], None
+            agent[name] = d
+            continue
         verdict, actors, ev = attribution_for(paths, epoch_of(d.get("since", "")))
         d["verdict"], d["actors"] = verdict, actors
         # When the last write landed, from the audit record rather than from a guess.
@@ -929,6 +1012,10 @@ def cmd_status(argv) -> int:
                 print(f"    {'':9s}   BY   {', '.join(actors)}")
             elif v == "none":
                 print(f"    {'':9s}   BY   unrecorded - the change predates the watch, or the log rotated")
+            elif v == "derived":
+                print(f"    {'':9s}   BY   engine-reported state, not a file - no audit record exists or could")
+            elif v == "unattributable":
+                print(f"    {'':9s}   BY   UNREADABLE - a write was recorded but its actor could not be parsed")
             elif v == "unwatched":
                 print(f"    {'':9s}   BY   UNKNOWN - these paths are not watched, so nothing can be concluded")
             elif v == "no-audit":
@@ -981,7 +1068,15 @@ def cmd_show(argv) -> int:
             print("  recorded:")
             for e in recs:
                 mark = "?" if e.get("deferred") else "-"
-                print(f"    {mark} {e['ts']}  {e.get('why', '')[:90]}")
+                # `.get("why", "")` returns None when the key EXISTS and is null, which is
+                # exactly what a `gap` record is: why=None by construction. Since sealing
+                # became automatic, gaps are the COMMON record, so `woam show` crashed on
+                # the most-read group of the most-used machine. Same shape as the `files`
+                # bug: a default that only applies to a missing key, on a key that is
+                # present and null.
+                why = e.get("why") or ("(sealed automatically - nobody said why)"
+                                       if e.get("ev") == "gap" else "")
+                print(f"    {mark} {e['ts']}  {why[:90]}")
                 # `what` is the machine-derived list of what changed; `files` is a
                 # COUNT. Subscripting the count threw TypeError and took the whole
                 # command down, on the exact path that matters: a note recorded
