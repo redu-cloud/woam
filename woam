@@ -48,6 +48,15 @@ from pathlib import Path
 
 VERSION = 1
 ROOT = Path(os.environ.get("WOAM_ROOT", "/etc/redu"))
+
+
+class Actionable(Exception):
+    """An error whose message already tells the operator what to do.
+
+    Printed WITHOUT the exception type, because 'PermissionError: [Errno 13]' is
+    noise in front of an instruction. Every raise site must produce a message that
+    a reader can act on with no further thought.
+    """
 LOG = ROOT / "changes.jsonl"
 BASELINE = ROOT / "baseline.json"
 SESSIONS = ROOT / "sessions"
@@ -825,6 +834,26 @@ def audit_rules_text() -> str:
     return "\n".join(lines) + "\n"
 
 
+def need_root_msg(action: str) -> str:
+    """The message an unprivileged write earns. It must contain the command, not advice.
+
+    Rebuilt from argv rather than hardcoded, so the operator can paste it back verbatim
+    including their own quoting. Falls back to a generic form if argv is unavailable.
+    """
+    try:
+        import shlex
+        cmd = "sudo woam " + " ".join(shlex.quote(a) for a in sys.argv[1:])
+    except Exception:                                # noqa: BLE001 - message path
+        cmd = "sudo woam ..."
+    try:
+        who = os.environ.get("USER") or str(os.getuid())
+    except Exception:                                # noqa: BLE001 - message path
+        who = "this user"
+    return (f"cannot {action}: {ROOT} is writable by root only, and you are {who}.\n"
+            f"  run:  {cmd}\n"
+            f"Nothing was recorded. This is not 'clean' - the change is still unexplained.")
+
+
 # ---------------------------------------------------------------------------
 # The log. One JSON object per line. RFC 8259 forbids a literal newline inside a
 # string, so the record delimiter cannot occur inside a record: the one-line
@@ -869,13 +898,23 @@ def append(rec: dict) -> None:
                "why": "record too large to store in full; detail dropped",
                "truncated": True}
         line = render()
-    ROOT.mkdir(parents=True, exist_ok=True)
-    # O_APPEND + a single write() is the atomic path. Never open("a") then print().
-    fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    # The journal is root-owned 0644, so an unprivileged `woam note` lands here. This
+    # used to raise a bare PermissionError, which main() rendered as
+    # "woam note: PermissionError: [Errno 13] Permission denied: '/etc/redu/changes.jsonl'".
+    # Measured on a real redu deploy 2026-08-16: an agent hit exactly that, recorded
+    # "needs sudo" as a note-to-self in its own report, and never wrote to the journal.
+    # The banner TELLS agents to record what they did; the command it points them at
+    # must not fail with a diagnosis instead of an instruction.
     try:
-        os.write(fd, (line + "\n").encode())
-    finally:
-        os.close(fd)
+        ROOT.mkdir(parents=True, exist_ok=True)
+        # O_APPEND + a single write() is the atomic path. Never open("a") then print().
+        fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (line + "\n").encode())
+        finally:
+            os.close(fd)
+    except PermissionError:
+        raise Actionable(need_root_msg("record this change"))
 
 
 def read_log() -> list:
@@ -1123,10 +1162,13 @@ def load_baseline() -> dict:
 
 
 def save_baseline(b: dict) -> None:
-    ROOT.mkdir(parents=True, exist_ok=True)
-    tmp = BASELINE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(b, indent=1, sort_keys=True))
-    os.replace(tmp, BASELINE)   # atomic; a reader never sees a half file
+    try:
+        ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = BASELINE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(b, indent=1, sort_keys=True))
+        os.replace(tmp, BASELINE)   # atomic; a reader never sees a half file
+    except PermissionError:
+        raise Actionable(need_root_msg("update the baseline"))
 
 
 def dirty_groups(against=None) -> dict:
@@ -2055,6 +2097,10 @@ def main() -> int:
         return 2
     try:
         return fn(rest)
+    except Actionable as e:
+        # Already phrased as an instruction; a type name in front of it only obscures.
+        print(f"woam {cmd}: {e}", file=sys.stderr)
+        return 1
     except Exception as e:                           # noqa: BLE001 - deliberate
         print(f"woam {cmd}: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

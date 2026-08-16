@@ -337,5 +337,26 @@ t "installer wires the notice into ~/.bashrc" "$?" ""
 rm -rf "$NDIR"
 
 echo
+echo "[13] an unprivileged write says HOW to fix it, not just what broke"
+# The journal is root-owned on a real machine, so `woam note` as a normal user hits
+# this path. It used to raise a bare PermissionError. Measured on a redu deploy
+# 2026-08-16: an agent hit it, wrote "needs sudo" into its own notes, and never used
+# the journal again. The login banner TELLS agents to record what they did, so the
+# command it points them at must answer with an instruction, not a diagnosis.
+RODIR="$(mktemp -d)/redu"
+mkdir -p "$RODIR" && chmod 0555 "$RODIR"
+ROOUT="$(WOAM_ROOT="$RODIR" python3 "$HERE/../woam" note app "a change" 2>&1)"; RORC=$?
+chmod 0755 "$RODIR" 2>/dev/null; rm -rf "$(dirname "$RODIR")"
+if [ "$(id -u)" = "0" ]; then
+  echo "  skipped (running as root, the unprivileged path cannot be reached)"
+else
+  t "an unwritable journal exits 1" "$([ "$RORC" = 1 ] && echo 0 || echo 1)" "got exit $RORC"
+  t "names the exact command to re-run" "$(printf '%s' "$ROOUT" | grep -qF 'sudo woam note app' && echo 0 || echo 1)" "$ROOUT"
+  t "quotes the reason so it can be pasted back" "$(printf '%s' "$ROOUT" | grep -qF "'a change'" && echo 0 || echo 1)" "$ROOUT"
+  t "refuses to be read as clean" "$(printf '%s' "$ROOUT" | grep -qiF 'not' && printf '%s' "$ROOUT" | grep -qiF 'clean' && echo 0 || echo 1)" "$ROOUT"
+  t "leads with the instruction, not the exception type" "$(printf '%s' "$ROOUT" | grep -qF 'PermissionError' && echo 1 || echo 0)" "$ROOUT"
+fi
+
+echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
