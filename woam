@@ -1793,6 +1793,12 @@ def cmd_banner(argv) -> int:
     #     and trains agents to ignore it, which is worse than not having it (the same
     #     "a false positive is worse than a miss" rule that governs the preflight rules).
     notice = "--notice" in argv
+    # A FORCED command (sshd sets SSH_ORIGINAL_COMMAND only then: a certificate's force-command or an authorized_keys
+    # command=) runs one fixed program for a platform caller, not an agent's shell, and nobody there can act on the
+    # notice. Measured 2026-10-11 on redu: it reached the platform's redeploy entry point and landed in an audit
+    # record. An agent's own `ssh host "cmd"` never carries the variable, so the notice still reaches every agent.
+    if notice and os.environ.get("SSH_ORIGINAL_COMMAND"):
+        return 0
     out = sys.stderr if notice else sys.stdout
     if not notice:
         print(BANNER)

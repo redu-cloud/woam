@@ -331,6 +331,14 @@ t "notice tells the agent HOW to ask who changed it" "$r" "$LOUD"
 SOUT="$(WOAM_ROOT="$NDIR" python3 "$HERE/../woam" banner --notice 2>/dev/null)"
 t "notice writes NOTHING to stdout" "$([ -z "$SOUT" ] && echo 0 || echo 1)" "$SOUT"
 
+# e) a FORCED command (a platform certificate's force-command) is not an agent's shell: nothing there can act on
+#    the notice, and on redu it landed in an audit record (2026-10-11). Silent there, still loud for `ssh host "cmd"`.
+FORCED="$(SSH_ORIGINAL_COMMAND='redeploy 0123' WOAM_ROOT="$NDIR" python3 "$HERE/../woam" banner --notice 2>&1)"
+t "notice is silent in a forced-command session" "$([ -z "$FORCED" ] && echo 0 || echo 1)" "$FORCED"
+AGENT="$(env -u SSH_ORIGINAL_COMMAND WOAM_ROOT="$NDIR" python3 "$HERE/../woam" banner --notice 2>&1)"
+case "$AGENT" in *UNEXPLAINED*) r=0;; *) r=1;; esac
+t "notice still speaks in an agent's ssh session" "$r" "$AGENT"
+
 # d) the installer must place it ABOVE Ubuntu's non-interactive guard, or it is dead code
 grep -q 'woam banner --notice' "$HERE/../install.sh"
 t "installer wires the notice into ~/.bashrc" "$?" ""
