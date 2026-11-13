@@ -206,6 +206,8 @@ t "and never invents an answer" "$(hasnt 'AGENT/HUMAN')"
 run audit-rules >/dev/null
 t "audit-rules still prints the watches with no auditd installed" "$(has '-k woam')"
 t "and never watches the whole filesystem" "$(hasnt '-w / -p')"
+t "nor as a syscall rule on /" "$(hasnt 'dir=/ -F')"
+t "and no -w watch, which the kernel checks on every syscall" "$(hasnt '-p wa -k')"
 
 echo
 echo "[13b] automatic sealing must not race the agent it is helping"

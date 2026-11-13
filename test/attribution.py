@@ -127,22 +127,62 @@ t("with attribution OFF nothing is excused as 'the system did it'",
 print("\n[5] the watches are generated from GROUPS, so they cannot drift")
 rules = m.audit_rules_text()
 _rl = [l for l in rules.splitlines() if l and not l.startswith("#")]
-t("every rule is either a narrow -w watch or an exec rule",
-  all(l.startswith("-w ") or l.startswith("-a always,exit ") for l in _rl),
-  str([l for l in _rl if not (l.startswith("-w ") or l.startswith("-a always,exit "))][:2]))
+_rules = [l for l in _rl if l != "-c"]
+t("every rule is an exit rule (no -w: the kernel checks those on EVERY syscall)",
+  all(l.startswith("-a always,exit ") for l in _rules),
+  str([l for l in _rules if not l.startswith("-a always,exit ")][:2]))
+# Measured 13 Nov 2026: a rule without -S cost +38% on a syscall-bound loop, scoped +15%.
+t("EVERY rule names its syscalls", all(" -S " in l for l in _rules),
+  str([l for l in _rules if " -S " not in l][:1]))
+t("every rule carries exactly one of the two keys",
+  all(m._rule_ident(l) and m._rule_ident(l)[0] in (m.AUDIT_KEY, m.AUDIT_CMD_KEY) for l in _rules))
+# The boot load is one auditctl pass; without -c the first missing path stops it.
+t("-c comes before every rule, so one refused rule cannot stop the boot load",
+  "-c" in _rl and all(not l.startswith("-a ") for l in _rl[:_rl.index("-c")]))
 
 # The exec rules are what answer "did an AGENT do this" for state with no file behind it.
 # auid!=unset must be in the KERNEL predicate: it is what stops a daemon's own work from
 # being recorded at all, which is both the correctness property and the volume control.
-_ex = [l for l in _rl if l.startswith("-a always,exit ")]
+_ex = [l for l in _rules if m._rule_ident(l)[0] == m.AUDIT_CMD_KEY]
 t("exec rules exist for the state-changing commands", len(_ex) > 0, str(len(_ex)))
 t("EVERY exec rule filters auid!=unset in the kernel",
   all("-F auid!=unset" in l for l in _ex),
   str([l for l in _ex if "-F auid!=unset" not in l][:1]))
-t("every exec rule is -F perm=x on a resolved absolute path",
-  all("-F perm=x" in l and re.search(r"-F path=/", l) for l in _ex))
+t("every exec rule is -S execve,execveat on a resolved absolute path",
+  all(f"-S {m.AUDIT_EXEC_SYSCALLS} " in l and re.search(r"-F path=/", l) for l in _ex))
 t("exec rules carry their own key, so they never mix with file writes",
   all(f"-k {m.AUDIT_CMD_KEY}" in l for l in _ex))
+
+_wa = [l for l in _rules if m._rule_ident(l)[0] == m.AUDIT_KEY]
+t("every watch is perm=wa over the write syscalls of its arch",
+  all("-F perm=wa" in l and f"-S {m.AUDIT_WRITE_SYSCALLS[m._rule_ident(l)[1]]} " in l for l in _wa),
+  str([l for l in _wa if "-F perm=wa" not in l][:1]))
+t("every watched path has a b64 AND a b32 rule (a 32-bit binary writes too)",
+  {(i[2], i[3]) for i in map(m._rule_ident, _wa) if i[1] == "b64"}
+  == {(i[2], i[3]) for i in map(m._rule_ident, _wa) if i[1] == "b32"})
+t("the write list has no read-only or fd-write syscall in it",
+  not any(s in m.AUDIT_WRITE_SYSCALLS[a].split(",") for a in ("b64", "b32")
+          for s in ("read", "write", "pread64", "pwrite64", "sendto", "recvfrom", "stat", "close")))
+
+print("\n[5a] reading rules back: the file form and the kernel's form are the same rule")
+# What `auditctl -l` printed on a real VM (auditd 3.1.2) for rules this file wrote.
+_k_watch = ("-a always,exit -F arch=b64 -S open,truncate,ftruncate,rename,mkdir,openat "
+            "-F dir=/etc/systemd/system -F perm=wa -F key=woam")
+_k_exec = "-a always,exit -F arch=b64 -S execve,execveat -F path=/usr/bin/systemctl -F auid!=-1 -F key=woam-cmd"
+_f_exec = f"-a always,exit -F arch=b64 -S execve,execveat -F path=/usr/bin/systemctl -F auid!=unset -k woam-cmd"
+t("an exec rule is recognised in force although the kernel rewrote auid and the key",
+  m._rule_ident(_k_exec) == m._rule_ident(_f_exec) == ("woam-cmd", "b64", "path", "/usr/bin/systemctl"))
+t("a watch is recognised whatever order the kernel prints its syscalls in",
+  m._rule_ident(_k_watch) == ("woam", "b64", "dir", "/etc/systemd/system"))
+t("path= and dir= on the same path are DIFFERENT rules (a path created as a dir later needs dir=)",
+  m._rule_ident(_k_watch.replace("dir=", "path=")) != m._rule_ident(_k_watch))
+t("the watched paths come from watches, never from exec rules",
+  m._paths_from([_k_watch, _k_exec]) == ["/etc/systemd/system"], str(m._paths_from([_k_watch, _k_exec])))
+t("b64 and b32 rules on one path count once",
+  m._paths_from([_k_watch, _k_watch.replace("b64", "b32")]) == ["/etc/systemd/system"])
+t("an old -w watch from an older woam still counts as watched",
+  m._paths_from(["-w /etc/redu-app -p wa -k woam"]) == ["/etc/redu-app"])
+t("-c and comments are not rules", m._rule_ident("-c") is None and m._rule_ident("# -a x") is None)
 
 print("\n[5b] a change with no command behind it is the engine's, not the agent's")
 # This is the requirement in one assertion: identical container state movement, but only
@@ -180,17 +220,18 @@ t("so the SAME state change becomes the AGENT's to explain",
 t("and the report carries the command that caused it",
   agC["app"].get("commands") == ["docker restart keycloak"], str(agC["app"].get("commands")))
 
-t("NEVER -w / (audit overhead is proportional to breadth)",
-  not any(l.startswith("-w / ") or l.strip() == "-w / -p wa -k woam" for l in rules.splitlines()))
-t("all watches carry the woam key", all("-k woam" in l for l in rules.splitlines() if l.startswith("-w")))
-t("covers the group paths", "-w /etc/redu-app -p wa -k woam" in rules)
+watched = m._paths_from(rules.splitlines())
+t("NEVER a watch on / (audit overhead is proportional to breadth)", "/" not in watched, str(watched[:3]))
+t("all watches carry the woam key",
+  all(f"-k {m.AUDIT_KEY}" in l for l in _rules if m._rule_ident(l)[0] != m.AUDIT_CMD_KEY))
+t("covers the group paths", "/etc/redu-app" in watched
+  and re.search(r"-F (dir|path)=/etc/redu-app -F perm=wa -k woam\n", rules))
 t("no globs survive: auditctl has none", not any("*" in l for l in rules.splitlines()))
 
 # The two that nearly shipped. Both flood the audit log, and the damage is not local:
 # auditd rotates at 8MB x 5 by default, so a hot watch silently shortens the attribution
 # history for EVERY OTHER group to minutes. A failure that quietly disables the feature
 # everywhere is worse than one that breaks loudly in one place.
-watched = [l.split()[1] for l in rules.splitlines() if l.startswith("-w ")]
 t("NEVER a recursive watch on /home - agents clone and build there",
   "/home" not in watched, str([w for w in watched if w.startswith("/home")]))
 t("a home key file is watched by its real path instead",

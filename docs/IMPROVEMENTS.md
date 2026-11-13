@@ -99,6 +99,8 @@ rpm-ostree keeps `requested-packages` alongside what actually took effect ([hand
 
 `auditctl(8)`: *"The -w form of writing watches is for backwards compatibility and is deprecated due to poor system performance."* The syscall form also lets us push `-F auid!=unset` into the **kernel**, cutting volume at the source. The cost is losing the `system` verdict on those paths, so make it a per-group knob and let the verdict reflect which mode a group is in.
 
+**The performance half is done (13 Nov 2026).** Every rule now names its syscalls (`AUDIT_WRITE_SYSCALLS`, `AUDIT_EXEC_SYSCALLS` in `woam`). Measured on a 1-vCPU VM, 4M one-byte read/write syscalls, median of 5: auditd off 3.01s, the `-w` watches 4.14s (+38%), the scoped rules 3.46s (+15%), and both recorded the same write, chmod, delete and command. The `auid!=unset` half is still open: watches keep recording system writes, so the `system` verdict is unchanged.
+
 ### 16. Ship an MCP server
 
 So an agent that is not SSHed in can still read the record. PROJECTMEM ships 15 tools; Cleric exposes `search_knowledge` over MCP so another vendor's agent can read it. Cross-vendor readability is the one axis where the market has already moved, and it is cheap.
