@@ -19,7 +19,7 @@
 #     "clean means I could not look" failure woam exists to prevent.
 #
 # Keep it SMALL. It merges into a larger user_data document and cloud providers cap user_data
-# (65,535 base64 characters on OpenStack Nova). This is why the tool is FETCHED and not embedded:
+# (65,535 base64 characters at the cloud provider). This is why the tool is FETCHED and not embedded:
 # ~36 KB inline blows a document already near the cap, and it fails at server-create, before a VM
 # exists, looking nothing like a cloud-init problem.
 #

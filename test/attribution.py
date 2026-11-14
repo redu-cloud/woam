@@ -334,13 +334,13 @@ t("sessionid too", ses is not None, str(ses))
 print("\n[8] secrets must never enter the record")
 # Capturing argv means capturing secrets unless you stop it. Measured the moment USER_CMD
 # parsing was switched on, on a real machine:
-#   docker exec -e PGPASSWORD=uLK7VpDeVytHk9yNQUmSh6ezH7oX redu-dojo-db-1 psql ...
-# That is the live database password, one step from being copied into changes.jsonl - a
+#   docker exec -e PGPASSWORD=EXAMPLEnotArealPassw0rd1234 redu-dojo-db-1 psql ...
+# That was a live database password (an example value here), one step from being copied into changes.jsonl - a
 # file whose stated promise is that secrets never enter it. Redact at WRITE: a value that
 # never enters the record cannot leak from it later.
 _R = m.redact_argv
 _cases = [
-    (["docker", "exec", "-e", "PGPASSWORD=uLK7VpDeVytHk9yNQUmSh6ezH7oX", "db"], "uLK7VpDeVytHk9yNQUmSh6ezH7oX"),
+    (["docker", "exec", "-e", "PGPASSWORD=EXAMPLEnotArealPassw0rd1234", "db"], "EXAMPLEnotArealPassw0rd1234"),
     (["mysql", "-u", "root", "-p", "hunter2"], "hunter2"),
     (["kcadm.sh", "--password", "admin123", "--server", "x"], "admin123"),
     (["curl", "-H", "Authorization:", "Bearer", "eyJhbGciOiJIUzI1NiJ9abc"], "eyJhbGciOiJIUzI1NiJ9abc"),
