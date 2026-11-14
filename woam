@@ -656,9 +656,9 @@ def audit_writes(since_epoch: float = 0.0, key: str = AUDIT_KEY, limit: int = 40
 # Secrets travel on command lines, so capturing argv means capturing secrets unless you
 # stop it. Measured on a real machine the moment USER_CMD parsing was switched on:
 #
-#   docker exec -e PGPASSWORD=uLK7VpDeVytHk9yNQUmSh6ezH7oX redu-dojo-db-1 psql ...
+#   docker exec -e PGPASSWORD=EXAMPLEnotArealPassw0rd1234 redu-dojo-db-1 psql ...
 #
-# That is the live database password, and woam was one step from copying it into
+# That was a live database password (an example value here), and woam was one step from copying it into
 # /etc/redu/changes.jsonl - a file whose stated promise is that secrets never enter it.
 # The audit log already contains this (that is auditd's business, not ours); woam must not
 # duplicate it into a second, longer-lived place.
