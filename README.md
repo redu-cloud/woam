@@ -225,9 +225,9 @@ that must never report "clean": a fresh install with no baseline, and an unrecor
 `public/` directory, which is what serves `https://redu.cloud/woam`. It refuses to run if the
 smoke test fails.
 
-**This repository is private, so the install URL is the only delivery path.** There is no raw
-GitHub fallback and the installer must never grow one: it would ask every machine for a
-credential it has no business holding.
+The installer downloads from `https://redu.cloud` (or `WOAM_URL_BASE`) and checks the file
+against its published checksum before installing it. `woam` is one file, so you can also take it
+straight from this repository.
 
 ## Licence
 

@@ -75,7 +75,7 @@ BANNER = ("redu.cloud: this cloud has its own rules and they are written down. "
 # ---------------------------------------------------------------------------
 # GROUPS -> SUBGROUPS -> paths.
 #
-# Two reasons for the second level, and speed is the one Milos asked for:
+# Two reasons for the second level, and speed is the one that matters most:
 #   1. LOCALISATION. "network/dns changed" beats "network changed".
 #   2. COST CONTROL. Each subgroup carries its own file budget, so one huge tree
 #      (an app checkout with a repo in it) cannot starve the cheap config paths
